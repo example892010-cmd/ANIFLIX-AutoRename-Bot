@@ -1,541 +1,309 @@
-import os
-
-import re
-
 import asyncio
-
 import logging
-
+import os
 from pathlib import Path
-
-from flask import Flask
-
 from threading import Thread
 
+from flask import Flask
 from telegram import Update
-
 from telegram.ext import (
-
     Application,
-
     CommandHandler,
-
-    MessageHandler,
-
     ContextTypes,
-
+    MessageHandler,
     filters,
-
 )
 
-# ── Configuration ──────────────────────────────────
+from config import load_config
+from storage import load_settings, save_settings
+from filename_parser import parse_filename
+from filename_utils import build_filename
+from thumbnail_utils import save_thumbnail_from_telegram, get_thumbnail_path, delete_thumbnail
+from metadata_utils import apply_metadata
+from file_utils import temporary_file, safe_file_size
+from logger_utils import setup_logger
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+logger = setup_logger()
+config = load_config()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+BOT_TOKEN = config["bot_token"]
+OWNER_ID = config["owner_id"]
+PORT = config["port"]
 
-PORT = int(os.getenv("PORT", "10000"))
+settings = load_settings()
+web = Flask(__name__)
 
-DATA_DIR = Path("data")
 
-DATA_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-
-    format="%(asctime)s - %(levelname)s - %(message)s",
-
-    level=logging.INFO,
-
-)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
-
-# ── Persistent settings ─────────────────────────────
-
-# Render's local filesystem may reset after a restart.
-
-SETTINGS_FILE = DATA_DIR / "settings.txt"
-
-settings = {
-
-    "format": "{title}",
-
-    "thumbnail": "",
-
-    "metadata": "",
-
-}
-
-def load_settings():
-
-    if SETTINGS_FILE.exists():
-
-        try:
-
-            lines = SETTINGS_FILE.read_text(encoding="utf-8").splitlines()
-
-            if len(lines) >= 3:
-
-                settings["format"] = lines[0] or "{title}"
-
-                settings["thumbnail"] = lines[1]
-
-                settings["metadata"] = lines[2]
-
-        except OSError:
-
-            logger.exception("Could not load settings")
-
-def save_settings():
-
-    try:
-
-        SETTINGS_FILE.write_text(
-
-            "\n".join([
-
-                settings["format"],
-
-                settings["thumbnail"],
-
-                settings["metadata"],
-
-            ]),
-
-            encoding="utf-8",
-
-        )
-
-    except OSError:
-
-        logger.exception("Could not save settings")
-
-# ── Render health check ─────────────────────────────
-
-@app.get("/")
-
+@web.get("/")
 def home():
-
     return "ANIFLIX Auto-Rename Bot is running!", 200
 
-@app.get("/health")
 
+@web.get("/health")
 def health():
-
     return {"status": "ok"}, 200
 
-def run_web_server():
 
-    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+def run_web():
+    web.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
-# ── Access control ───────────────────────────────────
 
 async def owner_only(update: Update) -> bool:
-
     user = update.effective_user
-
-    if user and user.id == OWNER_ID and OWNER_ID != 0:
-
+    if user and user.id == OWNER_ID:
         return True
 
     if update.effective_message:
-
-        await update.effective_message.reply_text(
-
-            "⛔ This bot is private."
-
-        )
-
+        await update.effective_message.reply_text("⛔ This bot is private.")
     return False
 
-# ── Commands ────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not await owner_only(update):
-
         return
 
     await update.effective_message.reply_text(
-
         "🍥 ANIFLIX AUTO-RENAME BOT\n\n"
-
         "Send me a video or document to rename it.\n\n"
-
         "/format - Set filename format\n"
-
-        "/setthumb - Set thumbnail using a photo\n"
-
-        "/viewthumb - View saved thumbnail\n"
-
-        "/delthumb - Delete thumbnail setting\n"
-
+        "/setthumb - Save a thumbnail by replying to a photo\n"
+        "/viewthumb - View the saved thumbnail\n"
+        "/delthumb - Delete thumbnail\n"
         "/metadata - View metadata settings\n"
-
         "/setmetadata - Set metadata text\n"
-
-        "/resetmetadata - Clear metadata text\n"
-
-        "/help - Show commands"
-
+        "/resetmetadata - Clear metadata\n"
+        "/help - Help"
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not await owner_only(update):
-
         return
 
     await update.effective_message.reply_text(
-
-        "📌 FORMAT EXAMPLE\n"
-
-        "/format {title} S{season} Ep{episode} [{quality}] [TAMIL]\n\n"
-
-        "Available placeholders:\n"
-
-        "{title} {season} {episode} {quality} {extension}\n\n"
-
-        "Send a photo to set your thumbnail, then use /setthumb.\n"
-
-        "Use /setmetadata followed by your metadata text.\n"
-
-        "Send a video or document to rename it."
-
+        "FORMAT EXAMPLE:\n"
+        "/format @ANIFLIXANIMETAMIL - {title} S{season} "
+        "Ep{episode} [{quality}] [TAMIL]\n\n"
+        "Placeholders: {title}, {season}, {episode}, "
+        "{quality}, {extension}\n\n"
+        "To set a thumbnail, send a photo and reply to it with /setthumb.\n"
+        "Use /setmetadata followed by metadata lines."
     )
 
-async def set_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
-
         return
 
-    new_format = " ".join(context.args).strip()
-
-    if not new_format:
-
+    template = " ".join(context.args).strip()
+    if not template:
         await update.effective_message.reply_text(
-
-            "Usage:\n/format {title} S{season} Ep{episode} [{quality}] [TAMIL]"
-
+            "Current format:\n" + settings["format"] +
+            "\n\nUsage:\n/format {title} S{season} Ep{episode} [{quality}] [TAMIL]"
         )
-
         return
 
-    allowed = {"title", "season", "episode", "quality", "extension"}
+    settings["format"] = template
+    save_settings(settings)
+    await update.effective_message.reply_text("✅ Format saved:\n" + template)
 
-    placeholders = re.findall(r"\{([^{}]+)\}", new_format)
 
-    unknown = [item for item in placeholders if item not in allowed]
-
-    if unknown:
-
-        await update.effective_message.reply_text(
-
-            "❌ Unknown placeholder(s): " + ", ".join(unknown)
-
-        )
-
-        return
-
-    settings["format"] = new_format
-
-    save_settings()
-
-    await update.effective_message.reply_text(
-
-        f"✅ Format saved:\n{new_format}"
-
-    )
-
-async def set_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+async def setthumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
-
-        return
-
-    photo = update.effective_message.reply_to_message
-
-    if photo and photo.photo:
-
-        settings["thumbnail"] = photo.photo[-1].file_id
-
-        save_settings()
-
-        await update.effective_message.reply_text("✅ Thumbnail saved!")
-
-        return
-
-    await update.effective_message.reply_text(
-
-        "First send a photo, then reply to that photo with /setthumb."
-
-    )
-
-async def view_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await owner_only(update):
-
-        return
-
-    thumb_id = settings["thumbnail"]
-
-    if not thumb_id:
-
-        await update.effective_message.reply_text("No thumbnail saved.")
-
-        return
-
-    await update.effective_message.reply_photo(thumb_id)
-
-async def delete_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await owner_only(update):
-
-        return
-
-    settings["thumbnail"] = ""
-
-    save_settings()
-
-    await update.effective_message.reply_text("✅ Thumbnail setting cleared.")
-
-async def view_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await owner_only(update):
-
-        return
-
-    value = settings["metadata"] or "(not set)"
-
-    await update.effective_message.reply_text(f"Metadata text:\n{value}")
-
-async def set_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await owner_only(update):
-
-        return
-
-    value = " ".join(context.args).strip()
-
-    if not value:
-
-        await update.effective_message.reply_text(
-
-            "Usage: /setmetadata Your metadata text"
-
-        )
-
-        return
-
-    settings["metadata"] = value
-
-    save_settings()
-
-    await update.effective_message.reply_text("✅ Metadata text saved.")
-
-async def reset_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await owner_only(update):
-
-        return
-
-    settings["metadata"] = ""
-
-    save_settings()
-
-    await update.effective_message.reply_text("✅ Metadata text cleared.")
-
-# ── File renaming ───────────────────────────────────
-
-def clean_filename(name: str) -> str:
-
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
-
-    name = name.strip(" .")
-
-    return (name or "renamed_file")[:180]
-
-def build_filename(original_name: str) -> str:
-
-    original = Path(original_name)
-
-    extension = original.suffix
-
-    title = original.stem
-
-    values = {
-
-        "title": title,
-
-        "season": "",
-
-        "episode": "",
-
-        "quality": "",
-
-        "extension": extension.lstrip("."),
-
-    }
-
-    try:
-
-        filename = settings["format"].format_map(values).strip()
-
-    except (KeyError, ValueError):
-
-        filename = title
-
-    filename = clean_filename(filename)
-
-    if extension and not filename.lower().endswith(extension.lower()):
-
-        filename += extension
-
-    return filename
-
-async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await owner_only(update):
-
         return
 
     message = update.effective_message
+    reply = message.reply_to_message
 
-    document = message.document
-
-    video = message.video
-
-    if not document and not video:
-
+    if not reply or not reply.photo:
+        await message.reply_text(
+            "Send a photo, then reply to that photo with /setthumb."
+        )
         return
 
-    original_name = (
+    try:
+        await save_thumbnail_from_telegram(context.bot, reply.photo[-1].file_id)
+        settings["thumbnail"] = reply.photo[-1].file_id
+        save_settings(settings)
+        await message.reply_text("✅ Thumbnail saved.")
+    except Exception:
+        logger.exception("Thumbnail save failed")
+        await message.reply_text("❌ Couldn't save that thumbnail.")
 
-        document.file_name if document and document.file_name
 
-        else video.file_name if video and video.file_name
+async def viewthumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
 
-        else f"video_{video.file_unique_id}.mp4" if video
-
-        else f"file_{document.file_unique_id}"
-
-    )
-
-    new_name = build_filename(original_name)
-
-    await message.reply_text("⏳ Processing your file...")
+    thumb_id = settings.get("thumbnail", "")
+    if not thumb_id:
+        await update.effective_message.reply_text("No thumbnail saved.")
+        return
 
     try:
-
-        file_obj = await context.bot.get_file(
-
-            document.file_id if document else video.file_id
-
+        await update.effective_message.reply_photo(thumb_id)
+    except Exception:
+        await update.effective_message.reply_text(
+            "❌ Saved thumbnail is unavailable. Set it again using /setthumb."
         )
 
-        local_path = DATA_DIR / f"input_{update.update_id}"
 
-        await file_obj.download_to_drive(custom_path=str(local_path))
+async def delthumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
 
-        # Preserve the original bytes; this bot does not encode files.
+    delete_thumbnail()
+    settings["thumbnail"] = ""
+    save_settings(settings)
+    await update.effective_message.reply_text("✅ Thumbnail setting cleared.")
 
-        await message.reply_document(
 
-            document=open(local_path, "rb"),
+async def metadata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
 
-            filename=new_name,
+    current = settings.get("metadata", "") or "(not set)"
+    await update.effective_message.reply_text("Metadata settings:\n" + current)
 
-            caption=f"✅ Renamed successfully!\n📄 {new_name}",
 
-            read_timeout=300,
+async def setmetadata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
 
-            write_timeout=300,
-
-            connect_timeout=30,
-
-            pool_timeout=30,
-
+    value = " ".join(context.args).strip()
+    if not value:
+        await update.effective_message.reply_text(
+            "Usage:\n/setmetadata title=My Anime artist=ANIFLIX"
         )
+        return
+
+    settings["metadata"] = value
+    save_settings(settings)
+    await update.effective_message.reply_text("✅ Metadata settings saved.")
+
+
+async def resetmetadata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+
+    settings["metadata"] = ""
+    save_settings(settings)
+    await update.effective_message.reply_text("✅ Metadata settings cleared.")
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+
+    message = update.effective_message
+    media = message.document or message.video
+
+    if not media:
+        return
+
+    original_name = getattr(media, "file_name", None) or "renamed_file.bin"
+    parsed = parse_filename(original_name)
+
+    # Use parsed details in the filename template.
+    template = settings.get("format", "{title}")
+    extension = Path(original_name).suffix
+    values = {
+        "title": parsed["title"],
+        "season": parsed["season"],
+        "episode": parsed["episode"],
+        "quality": parsed["quality"],
+        "extension": extension.lstrip("."),
+    }
+
+    # The builder extracts the original title itself, so construct from
+    # the parsed title and then use a template with the original extension.
+    source_name = parsed["title"] + extension
+    new_name = build_filename(source_name, template)
+
+    # Fill season/episode/quality based on the detected values.
+    for key, value in values.items():
+        new_name = new_name.replace("{" + key + "}", value)
+
+    # Remove any placeholders that weren't resolved.
+    import re
+    new_name = re.sub(r"\{[^{}]*\}", "", new_name)
+    new_name = re.sub(r"\s+", " ", new_name).strip()
+    if extension and not new_name.lower().endswith(extension.lower()):
+        new_name = new_name.rstrip(". ") + extension
+
+    await message.reply_text("⏳ Renaming your file...")
+
+    try:
+        telegram_file = await context.bot.get_file(media.file_id)
+
+        with temporary_file(suffix=extension) as temp_path:
+            await telegram_file.download_to_drive(custom_path=str(temp_path))
+
+            size = safe_file_size(temp_path)
+            if size <= 0:
+                await message.reply_text("❌ The downloaded file is empty.")
+                return
+
+            metadata_text = settings.get("metadata", "")
+            if metadata_text:
+                ok, result = apply_metadata(str(temp_path), metadata_text)
+                if not ok:
+                    logger.info("Metadata not applied: %s", result)
+
+            # Telegram supports thumbnails for certain media types, but sending
+            # as a document does not display a video thumbnail in every client.
+            thumb_path = get_thumbnail_path()
+            with open(temp_path, "rb") as file_handle:
+                if thumb_path and Path(thumb_path).exists():
+                    with open(thumb_path, "rb") as thumb_handle:
+                        await message.reply_document(
+                            document=file_handle,
+                            filename=new_name,
+                            thumbnail=thumb_handle,
+                            caption=f"✅ Renamed successfully!\n📄 {new_name}",
+                            read_timeout=300,
+                            write_timeout=300,
+                            connect_timeout=30,
+                            pool_timeout=30,
+                        )
+                else:
+                    await message.reply_document(
+                        document=file_handle,
+                        filename=new_name,
+                        caption=f"✅ Renamed successfully!\n📄 {new_name}",
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
 
     except Exception:
-
         logger.exception("File processing failed")
-
         await message.reply_text(
-
-            "❌ Could not process this file. Please try a smaller file."
-
+            "❌ File processing failed. Check Render logs and try again."
         )
 
-    finally:
-
-        try:
-
-            if "local_path" in locals() and local_path.exists():
-
-                local_path.unlink()
-
-        except OSError:
-
-            logger.warning("Could not remove temporary file")
-
-# ── Start bot ───────────────────────────────────────
 
 def main():
-
-    if not BOT_TOKEN:
-
-        raise RuntimeError("Please set BOT_TOKEN in Render environment variables.")
-
-    if OWNER_ID == 0:
-
-        raise RuntimeError("Please set OWNER_ID in Render environment variables.")
-
-    load_settings()
-
-    Thread(target=run_web_server, daemon=True).start()
+    Thread(target=run_web, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
-
     application.add_handler(CommandHandler("help", help_command))
-
-    application.add_handler(CommandHandler("format", set_format))
-
-    application.add_handler(CommandHandler("setthumb", set_thumbnail))
-
-    application.add_handler(CommandHandler("viewthumb", view_thumbnail))
-
-    application.add_handler(CommandHandler("delthumb", delete_thumbnail))
-
-    application.add_handler(CommandHandler("metadata", view_metadata))
-
-    application.add_handler(CommandHandler("setmetadata", set_metadata))
-
-    application.add_handler(CommandHandler("resetmetadata", reset_metadata))
-
+    application.add_handler(CommandHandler("format", format_command))
+    application.add_handler(CommandHandler("setthumb", setthumb_command))
+    application.add_handler(CommandHandler("viewthumb", viewthumb_command))
+    application.add_handler(CommandHandler("delthumb", delthumb_command))
+    application.add_handler(CommandHandler("metadata", metadata_command))
+    application.add_handler(CommandHandler("setmetadata", setmetadata_command))
+    application.add_handler(CommandHandler("resetmetadata", resetmetadata_command))
     application.add_handler(
-
-        MessageHandler(
-
-            filters.VIDEO | filters.Document.ALL,
-
-            process_file,
-
-        )
-
+        MessageHandler(filters.VIDEO | filters.Document.ALL, handle_file)
     )
 
     logger.info("Starting ANIFLIX Auto-Rename Bot")
-
     application.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     main()
