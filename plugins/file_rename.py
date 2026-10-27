@@ -18,7 +18,6 @@ from helper.database import codeflixbots
 from helper.file_names import (
     extract_quality,
     extract_season_episode,
-    extract_title,
     format_caption,
     metadata_enabled,
     render_filename,
@@ -26,6 +25,7 @@ from helper.file_names import (
 )
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
+from plugins.episode_publisher import store_file_and_process
 
 logger = logging.getLogger(__name__)
 
@@ -201,10 +201,10 @@ async def auto_rename_files(client, message):
     renaming_operations[file_id] = now
 
     status = None
+    sent_message = None
+    storage_result = None
     started_at = time.perf_counter()
     timings = {}
-    storage_error = None
-    stored_message_id = None
     try:
         new_filename = render_filename(original_name, format_template)
         extension = Path(original_name).suffix.lower()
@@ -301,66 +301,25 @@ async def auto_rename_files(client, message):
                 sent_message = await client.send_document(document=output_path, **upload_params)
             timings["upload"] = time.perf_counter() - stage_started
 
-        # Optional Telegram File Store. The current rename flow is unchanged when
-        # STORAGE_CHANNEL_ID is not configured. Copy the successfully renamed file
-        # from the user's chat to the private channel, then persist its lookup details.
-        storage_channel = os.environ.get("STORAGE_CHANNEL_ID", "").strip()
-        if storage_channel:
+        # Save a separate copy in the configured Telegram storage channel, then group
+        # the stored file by anime/season/episode/quality. Publication is gated on all
+        # three required qualities being present and independently verified.
+        if sent_message is not None:
             try:
-                # Prefer a public @username when available: Pyrogram may not have
-                # a numeric channel peer cached yet, causing "Peer id invalid".
-                storage_target = (
-                    int(storage_channel)
-                    if storage_channel.lstrip("-").isdigit()
-                    else storage_channel
+                storage_result = await store_file_and_process(
+                    client=client,
+                    sent_message=sent_message,
+                    new_filename=new_filename,
+                    user_id=user_id,
+                    file_size=file_size,
                 )
-                storage_chat = await client.get_chat(storage_target)
-                storage_chat_id = int(storage_chat.id)
-                stored_message = await client.copy_message(
-                    chat_id=storage_chat_id,
-                    from_chat_id=sent_message.chat.id,
-                    message_id=sent_message.id,
+            except Exception as storage_exc:
+                logger.exception("Renamed file could not be stored/processed for user %s", user_id)
+                storage_result = (
+                    "⚠️ File renamed and returned, but File Store failed. Check STORAGE_CHANNEL_ID, "
+                    "bot channel permissions, and MongoDB access.\n\n"
+                    f"{type(storage_exc).__name__}: {storage_exc}"
                 )
-                stored_message_id = int(stored_message.id)
-
-                stored_media = (
-                    getattr(stored_message, "document", None)
-                    or getattr(stored_message, "video", None)
-                    or getattr(stored_message, "audio", None)
-                    or getattr(stored_message, "animation", None)
-                )
-                season, episode = extract_season_episode(new_filename)
-                record = {
-                    "user_id": int(user_id),
-                    "source_chat_id": int(sent_message.chat.id),
-                    "source_message_id": int(sent_message.id),
-                    "storage_chat_id": storage_chat_id,
-                    "storage_message_id": stored_message_id,
-                    "filename": str(new_filename),
-                    "title": extract_title(new_filename),
-                    "season": season,
-                    "episode": episode,
-                    "quality": extract_quality(new_filename),
-                    "file_id": getattr(stored_media, "file_id", None),
-                    "file_unique_id": getattr(stored_media, "file_unique_id", None),
-                    "file_size": int(getattr(stored_media, "file_size", file_size) or file_size),
-                    "created_at": datetime.utcnow(),
-                }
-                await codeflixbots.codeflixbots["file_store"].update_one(
-                    {
-                        "storage_chat_id": storage_chat_id,
-                        "storage_message_id": stored_message_id,
-                    },
-                    {"$set": record},
-                    upsert=True,
-                )
-                logger.info(
-                    "File stored: channel=%s message=%s filename=%s quality=%s",
-                    storage_chat_id, stored_message_id, new_filename, record["quality"],
-                )
-            except Exception as exc:
-                storage_error = f"{type(exc).__name__}: {exc}"
-                logger.exception("Renamed file could not be saved to configured File Store")
 
         timings["total"] = time.perf_counter() - started_at
         logger.info(
@@ -369,19 +328,10 @@ async def auto_rename_files(client, message):
             timings.get("thumbnail", 0.0), timings.get("upload", 0.0), timings["total"],
             metadata_enabled(meta_state), new_filename,
         )
-        if storage_error:
-            await _safe_edit(
-                status,
-                "⚠️ File renamed and sent, but File Store failed. Check STORAGE_CHANNEL_ID, bot admin permissions, and MongoDB access.\n\n"
-                + storage_error[:2500],
-            )
-        elif os.environ.get("STORAGE_CHANNEL_ID", "").strip():
-            await _safe_edit(
-                status,
-                f"✅ Renamed successfully and saved to File Store.\n\nStorage message ID: `{stored_message_id}`",
-            )
-        else:
-            await _safe_edit(status, "✅ Done! File renamed successfully.")
+        await _safe_edit(
+            status,
+            storage_result or "✅ Done! File renamed successfully.",
+        )
         logger.info("Renamed %s -> %s for user %s", original_name, new_filename, user_id)
 
     except FloodWait as exc:
