@@ -307,7 +307,15 @@ async def auto_rename_files(client, message):
         storage_channel = os.environ.get("STORAGE_CHANNEL_ID", "").strip()
         if storage_channel:
             try:
-                storage_chat_id = int(storage_channel)
+                # Prefer a public @username when available: Pyrogram may not have
+                # a numeric channel peer cached yet, causing "Peer id invalid".
+                storage_target = (
+                    int(storage_channel)
+                    if storage_channel.lstrip("-").isdigit()
+                    else storage_channel
+                )
+                storage_chat = await client.get_chat(storage_target)
+                storage_chat_id = int(storage_chat.id)
                 stored_message = await client.copy_message(
                     chat_id=storage_chat_id,
                     from_chat_id=sent_message.chat.id,
