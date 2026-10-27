@@ -7,6 +7,8 @@ post is sent until all three qualities have been stored and checked in Telegram.
 import asyncio
 import hashlib
 import logging
+import re
+from difflib import SequenceMatcher
 import os
 import secrets
 from datetime import datetime
@@ -28,6 +30,9 @@ from helper.file_names import (
 logger = logging.getLogger(__name__)
 EXPECTED_QUALITIES = ("480p", "720p", "1080p")
 _BATCH_LOCKS: dict[str, asyncio.Lock] = {}
+# The rename handler may process multiple uploads concurrently. Serialize store + group
+# mutations so two simultaneous qualities cannot race into separate episode batches.
+_STORE_PROCESS_LOCK = asyncio.Lock()
 
 DEFAULT_INDIVIDUAL_TEMPLATE = (
     "⬡ {title} | Official Tamil Dub\n\n"
@@ -44,6 +49,44 @@ def _now():
 
 def _title_key(title: str) -> str:
     return normalize_anime_title(title)
+
+
+_TITLE_NOISE_SUFFIXES = {
+    "official", "tamil", "audio", "dub", "dubbed", "sub", "subbed",
+    "version", "eng", "english", "japanese", "dual", "multi", "uncensored",
+    "hindi", "telugu", "malayalam", "kannada", "bengali", "jpn",
+    "hd", "sd", "fhd", "hdrip", "hdtv", "webrip", "web", "dl",
+    "bluray", "brrip", "x264", "x265", "hevc", "av1",
+}
+
+
+def _comparison_title(value: str) -> str:
+    """Normalize harmless naming variants without merging distinct short titles."""
+    text = _title_key(value)
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    tokens = text.split()
+    # Release labels sometimes remain in the title after filenames are renamed.
+    # Strip only trailing labels; never remove words in the middle of a real title.
+    while tokens and tokens[-1] in _TITLE_NOISE_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _title_similarity(left: str, right: str) -> float:
+    a = _comparison_title(left)
+    b = _comparison_title(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    # Prevent short titles such as "Naruto" from matching "Naruto Shippuden".
+    if min(len(a), len(b)) < 10:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _titles_match(left: str, right: str) -> bool:
+    return _title_similarity(left, right) >= 0.92
 
 
 def _batch_id(title_key: str, season: str, episode: str) -> str:
@@ -144,7 +187,7 @@ async def _verify_batch_files(client, batch: dict) -> tuple[bool, str]:
                 or str(int(entry_season)) != str(batch.get("season"))
                 or str(int(entry_episode)) != str(batch.get("episode"))):
             return False, f"The {quality} filename does not match the saved season/episode."
-        if _title_key(extract_title(entry.get("filename", ""))) != batch.get("title_key"):
+        if not _titles_match(extract_title(entry.get("filename", "")), batch.get("title", batch.get("title_key", ""))):
             return False, f"The {quality} filename does not match the saved anime title."
         try:
             stored_username = (entry.get("storage_chat_username") or "").strip()
@@ -282,9 +325,7 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
         if not token_record or token_record.get("url") != access_url:
             return f"⚠️ {quality} was verified, but its access link could not be saved. Nothing was published."
 
-    route = await codeflixbots.codeflixbots["anime_routes"].find_one(
-        {"title_key": batch["title_key"]}
-    )
+    route = await _find_route_for_batch(batch)
     if not route:
         await codeflixbots.codeflixbots["episode_batches"].update_one(
             {"_id": batch["_id"]},
@@ -335,6 +376,129 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
     return "✅ All 3 qualities stored and verified. Links generated and episode post(s) published."
 
 
+async def _find_route_for_batch(batch: dict):
+    """Find an exact route first, then a single high-confidence title variant."""
+    routes = codeflixbots.codeflixbots["anime_routes"]
+    exact = await routes.find_one({"title_key": batch.get("title_key")})
+    if exact:
+        return exact
+    cursor = routes.find({})
+    candidates = []
+    async for route in cursor:
+        score = _title_similarity(
+            route.get("title_key") or route.get("title", ""),
+            batch.get("title_key") or batch.get("title", ""),
+        )
+        if score >= 0.92:
+            candidates.append((score, route))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    # If two different saved routes are equally plausible, do not guess a channel.
+    if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.03:
+        return None
+    return candidates[0][1]
+
+
+async def _find_or_merge_episode_batch(batches, group_id: str, title: str,
+                                       title_key: str, season: str, episode: str):
+    """Reuse an episode group when harmless filename/title variants split qualities.
+
+    Search by the same season and episode even when the incoming file's exact hash
+    already exists. This repairs the specific case where 720p and 1080p were saved in
+    separate pending batches before the grouping fix was deployed.
+    """
+    exact = await batches.find_one({"_id": group_id})
+    if exact and exact.get("state") == "published":
+        return exact, "published"
+
+    cursor = batches.find({
+        "season": str(season),
+        "episode": str(episode),
+        "state": {"$ne": "merged"},
+    })
+    all_candidates = await cursor.to_list(length=100)
+    matches = []
+    seen_ids = set()
+    for candidate in all_candidates:
+        candidate_id = str(candidate.get("_id", ""))
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        score = _title_similarity(
+            candidate.get("title_key") or candidate.get("title", ""),
+            title_key or title,
+        )
+        if score >= 0.92 or candidate_id == str(group_id):
+            matches.append((score, candidate))
+
+    # If a matching episode was already published under a previous title variant,
+    # preserve duplicate protection rather than creating a second episode post.
+    published = [(score, candidate) for score, candidate in matches
+                 if candidate.get("state") == "published"]
+    if published:
+        published.sort(key=lambda item: item[0], reverse=True)
+        return published[0][1], "published"
+
+    pending = [(score, candidate) for score, candidate in matches
+               if candidate.get("state") not in {"published", "merged"}]
+    if not pending:
+        return None, None
+
+    # Prefer the exact ID if it exists; otherwise keep the best-matching / fullest
+    # batch as canonical so links and publish history remain stable.
+    exact_entry = next((item for item in pending if str(item[1].get("_id")) == str(group_id)), None)
+    if exact_entry:
+        canonical = exact_entry[1]
+    else:
+        pending.sort(key=lambda item: (item[0], len(item[1].get("files") or {})), reverse=True)
+        canonical = pending[0][1]
+    canonical_id = str(canonical["_id"])
+    current_files = canonical.get("files") or {}
+
+    for _score, other in pending:
+        other_id = str(other.get("_id", ""))
+        if other_id == canonical_id:
+            continue
+        other_files = other.get("files") or {}
+        conflict = False
+        for quality in EXPECTED_QUALITIES:
+            field = _quality_field(quality)
+            left = current_files.get(field)
+            right = other_files.get(field)
+            if left and right:
+                left_uid = left.get("file_unique_id")
+                right_uid = right.get("file_unique_id")
+                if left_uid and right_uid and left_uid == right_uid:
+                    continue
+                # Never silently choose between two different files of one quality.
+                conflict = True
+                break
+        if conflict:
+            logger.warning(
+                "Not merging episode batches %s and %s: conflicting quality slots",
+                canonical_id, other_id,
+            )
+            continue
+
+        updates = {}
+        for quality in EXPECTED_QUALITIES:
+            field = _quality_field(quality)
+            if not current_files.get(field) and other_files.get(field):
+                current_files[field] = other_files[field]
+                updates[f"files.{field}"] = other_files[field]
+        if updates:
+            updates["updated_at"] = _now()
+            await batches.update_one({"_id": canonical_id}, {"$set": updates})
+        await batches.update_one(
+            {"_id": other_id},
+            {"$set": {"state": "merged", "merged_into": canonical_id, "updated_at": _now()}},
+        )
+
+    refreshed = await batches.find_one({"_id": canonical_id})
+    return refreshed or canonical, None
+
+
 async def publish_ready_batch(client, batch: dict) -> str:
     """Serialize publication per episode and reload current DB state before sending."""
     batch_id = str(batch.get("_id", ""))
@@ -344,9 +508,7 @@ async def publish_ready_batch(client, batch: dict) -> str:
         if not current:
             return "⚠️ Episode batch disappeared from MongoDB; nothing was published."
         if current.get("state") == "published":
-            current_route = await codeflixbots.codeflixbots["anime_routes"].find_one(
-                {"title_key": current.get("title_key")}
-            ) or {}
+            current_route = await _find_route_for_batch(current) or {}
             published_targets = current.get("published_targets") or {}
             has_unpublished_target = any(
                 current_route.get(field)
@@ -361,8 +523,8 @@ async def publish_ready_batch(client, batch: dict) -> str:
         return await _publish_ready_batch_locked(client, current)
 
 
-async def store_file_and_process(client, sent_message, new_filename: str, user_id: int, file_size: int) -> str:
-    """Copy a renamed file into storage, persist metadata, and process episode grouping."""
+async def _store_file_and_process_locked(client, sent_message, new_filename: str, user_id: int, file_size: int) -> str:
+    """Implementation protected by the global store/grouping lock."""
     storage_setting = os.environ.get("STORAGE_CHANNEL_ID", "").strip()
     fallback_username = os.environ.get("STORAGE_CHANNEL_USERNAME", "").strip()
     if not storage_setting:
@@ -396,6 +558,10 @@ async def store_file_and_process(client, sent_message, new_filename: str, user_i
     title = extract_title(new_filename)
     title_key = _title_key(title)
     created_at = _now()
+    logger.info(
+        "Stored episode parse: filename=%r title=%r title_key=%r season=%r episode=%r quality=%r",
+        new_filename, title, title_key, season, episode, quality,
+    )
     record = {
         "user_id": int(user_id),
         "storage_chat_id": int(storage_chat.id),
@@ -454,9 +620,21 @@ async def store_file_and_process(client, sent_message, new_filename: str, user_i
         "verified_at": None,
     }
     batches = codeflixbots.codeflixbots["episode_batches"]
-    existing = await batches.find_one({"_id": group_id})
-    if existing and existing.get("state") == "published":
+    existing, match_status = await _find_or_merge_episode_batch(
+        batches,
+        group_id,
+        title,
+        title_key,
+        str(int(season)),
+        str(int(episode)),
+    )
+    if match_status == "published" or (existing and existing.get("state") == "published"):
         return f"✅ File saved. This episode has already been published; duplicate {quality} was not published again."
+    if existing:
+        group_id = str(existing["_id"])
+        # Keep the main batch's saved title key for its route and verification history.
+        title_key = existing.get("title_key") or title_key
+        title = existing.get("title") or title
 
     await batches.update_one(
         {"_id": group_id},
@@ -492,6 +670,18 @@ async def store_file_and_process(client, sent_message, new_filename: str, user_i
     # Re-read media from Telegram to ensure all three stored messages are present.
     result = await publish_ready_batch(client, batch)
     return result
+
+
+async def store_file_and_process(client, sent_message, new_filename: str, user_id: int, file_size: int) -> str:
+    """Serialize stored-file writes and episode grouping across concurrent uploads."""
+    async with _STORE_PROCESS_LOCK:
+        return await _store_file_and_process_locked(
+            client=client,
+            sent_message=sent_message,
+            new_filename=new_filename,
+            user_id=user_id,
+            file_size=file_size,
+        )
 
 
 # ---------- Owner-only channel and template configuration commands ----------
@@ -565,8 +755,10 @@ async def set_anime_channels(client, message):
         "I will publish only after 480p, 720p, and 1080p are stored and verified."
     )
     # Publish batches that were already complete while no route was configured.
-    cursor = codeflixbots.codeflixbots["episode_batches"].find({"title_key": key})
+    cursor = codeflixbots.codeflixbots["episode_batches"].find({"state": {"$ne": "merged"}})
     async for batch in cursor:
+        if not _titles_match(batch.get("title_key") or batch.get("title", ""), key):
+            continue
         files = batch.get("files") or {}
         if all(files.get(_quality_field(q)) for q in EXPECTED_QUALITIES):
             result = await publish_ready_batch(client, batch)
@@ -650,6 +842,60 @@ async def list_anime_channels(client, message):
             f"  Ongoing: {route.get('ongoing_channel') or 'Not set'}"
         )
     await message.reply_text("\n\n".join(lines) if lines else "No anime channel routes saved yet.")
+
+
+@Client.on_message(filters.private & filters.command("fixepisodegroups"))
+async def fix_episode_groups(client, message):
+    """Owner-only repair for split pending batches created by the previous grouping bug."""
+    if not _is_admin(message):
+        return await message.reply_text("⛔ Owner/admin only.")
+
+    batches_col = codeflixbots.codeflixbots["episode_batches"]
+    cursor = batches_col.find({"state": {"$nin": ["published", "merged"]}}).sort("updated_at", 1).limit(500)
+    pending = await cursor.to_list(length=500)
+    if not pending:
+        return await message.reply_text("✅ No pending episode groups need repair.")
+
+    merged_count = 0
+    published_count = 0
+    waiting = []
+    visited = set()
+    async with _STORE_PROCESS_LOCK:
+        for old_batch in pending:
+            if old_batch.get("state") in {"published", "merged"}:
+                continue
+            batch, match_status = await _find_or_merge_episode_batch(
+                batches_col,
+                str(old_batch.get("_id", "")),
+                old_batch.get("title", ""),
+                old_batch.get("title_key", ""),
+                str(old_batch.get("season", "")),
+                str(old_batch.get("episode", "")),
+            )
+            if match_status == "published" or not batch:
+                continue
+            canonical_id = str(batch.get("_id", ""))
+            if not canonical_id or canonical_id in visited:
+                continue
+            visited.add(canonical_id)
+            files = batch.get("files") or {}
+            present = [q for q in EXPECTED_QUALITIES if files.get(_quality_field(q))]
+            if len(present) == 3:
+                result = await publish_ready_batch(client, batch)
+                if "published" in result.lower() or "links are ready" in result.lower():
+                    published_count += 1
+                waiting.append(f"{batch.get('title')} S{batch.get('season')}E{batch.get('episode')}: {result}")
+            else:
+                waiting.append(
+                    f"{batch.get('title')} S{batch.get('season')}E{batch.get('episode')}: "
+                    f"{len(present)}/3 stored; waiting for "
+                    f"{', '.join(q for q in EXPECTED_QUALITIES if q not in present)}"
+                )
+            merged_count += 1
+
+    header = f"🛠 Repair scan finished. Checked {merged_count} episode group(s); {published_count} complete group(s) processed."
+    details = "\n\n".join(waiting[:15])
+    await message.reply_text((header + ("\n\n" + details if details else ""))[:3900])
 
 
 @Client.on_message(filters.private & filters.command("episodequeue"))
