@@ -18,6 +18,10 @@ services:
         sync: false
       - key: DB_NAME
         value: autorenamebot
+      - key: STORAGE_CHANNEL_ID
+        sync: false
+      - key: STORAGE_CHANNEL_USERNAME
+        sync: false
       - key: ADMIN
         sync: false
       - key: LOG_CHANNEL
