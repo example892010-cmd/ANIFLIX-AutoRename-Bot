@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Local sessions, logs, and downloaded media
+*.session
+*.session-journal
+*.log
+downloads/
+metadata/
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
