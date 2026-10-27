@@ -18,6 +18,7 @@ from helper.database import codeflixbots
 from helper.file_names import (
     extract_quality,
     extract_season_episode,
+    extract_title,
     format_caption,
     metadata_enabled,
     render_filename,
@@ -202,6 +203,8 @@ async def auto_rename_files(client, message):
     status = None
     started_at = time.perf_counter()
     timings = {}
+    storage_error = None
+    stored_message_id = None
     try:
         new_filename = render_filename(original_name, format_template)
         extension = Path(original_name).suffix.lower()
@@ -287,16 +290,69 @@ async def auto_rename_files(client, message):
 
             stage_started = time.perf_counter()
             if upload_type == "video":
-                await client.send_video(
+                sent_message = await client.send_video(
                     video=output_path,
                     supports_streaming=extension == ".mp4",
                     **upload_params,
                 )
             elif upload_type == "audio":
-                await client.send_audio(audio=output_path, **upload_params)
+                sent_message = await client.send_audio(audio=output_path, **upload_params)
             else:
-                await client.send_document(document=output_path, **upload_params)
+                sent_message = await client.send_document(document=output_path, **upload_params)
             timings["upload"] = time.perf_counter() - stage_started
+
+        # Optional Telegram File Store. The current rename flow is unchanged when
+        # STORAGE_CHANNEL_ID is not configured. Copy the successfully renamed file
+        # from the user's chat to the private channel, then persist its lookup details.
+        storage_channel = os.environ.get("STORAGE_CHANNEL_ID", "").strip()
+        if storage_channel:
+            try:
+                storage_chat_id = int(storage_channel)
+                stored_message = await client.copy_message(
+                    chat_id=storage_chat_id,
+                    from_chat_id=sent_message.chat.id,
+                    message_id=sent_message.id,
+                )
+                stored_message_id = int(stored_message.id)
+
+                stored_media = (
+                    getattr(stored_message, "document", None)
+                    or getattr(stored_message, "video", None)
+                    or getattr(stored_message, "audio", None)
+                    or getattr(stored_message, "animation", None)
+                )
+                season, episode = extract_season_episode(new_filename)
+                record = {
+                    "user_id": int(user_id),
+                    "source_chat_id": int(sent_message.chat.id),
+                    "source_message_id": int(sent_message.id),
+                    "storage_chat_id": storage_chat_id,
+                    "storage_message_id": stored_message_id,
+                    "filename": str(new_filename),
+                    "title": extract_title(new_filename),
+                    "season": season,
+                    "episode": episode,
+                    "quality": extract_quality(new_filename),
+                    "file_id": getattr(stored_media, "file_id", None),
+                    "file_unique_id": getattr(stored_media, "file_unique_id", None),
+                    "file_size": int(getattr(stored_media, "file_size", file_size) or file_size),
+                    "created_at": datetime.utcnow(),
+                }
+                await codeflixbots.codeflixbots["file_store"].update_one(
+                    {
+                        "storage_chat_id": storage_chat_id,
+                        "storage_message_id": stored_message_id,
+                    },
+                    {"$set": record},
+                    upsert=True,
+                )
+                logger.info(
+                    "File stored: channel=%s message=%s filename=%s quality=%s",
+                    storage_chat_id, stored_message_id, new_filename, record["quality"],
+                )
+            except Exception as exc:
+                storage_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("Renamed file could not be saved to configured File Store")
 
         timings["total"] = time.perf_counter() - started_at
         logger.info(
@@ -305,7 +361,19 @@ async def auto_rename_files(client, message):
             timings.get("thumbnail", 0.0), timings.get("upload", 0.0), timings["total"],
             metadata_enabled(meta_state), new_filename,
         )
-        await _safe_edit(status, "✅ Done! File renamed successfully.")
+        if storage_error:
+            await _safe_edit(
+                status,
+                "⚠️ File renamed and sent, but File Store failed. Check STORAGE_CHANNEL_ID, bot admin permissions, and MongoDB access.\n\n"
+                + storage_error[:2500],
+            )
+        elif os.environ.get("STORAGE_CHANNEL_ID", "").strip():
+            await _safe_edit(
+                status,
+                f"✅ Renamed successfully and saved to File Store.\n\nStorage message ID: `{stored_message_id}`",
+            )
+        else:
+            await _safe_edit(status, "✅ Done! File renamed successfully.")
         logger.info("Renamed %s -> %s for user %s", original_name, new_filename, user_id)
 
     except FloodWait as exc:
