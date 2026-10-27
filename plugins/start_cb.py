@@ -91,6 +91,54 @@ async def start(client: Client, message: Message):
         )
         return
 
+    # File Store deep links use /start file_<token>. Deliver only the exact file
+    # referenced by a token that exists in the database; never trust user-supplied IDs.
+    start_parts = (message.text or "").split(maxsplit=1)
+    payload = start_parts[1].strip() if len(start_parts) > 1 else ""
+    if payload.startswith("file_"):
+        token = payload[5:]
+        if not token or len(token) > 60 or not all(ch.isalnum() or ch in "_-" for ch in token):
+            return await message.reply_text("❌ This file link is invalid.")
+        try:
+            stored_record = await codeflixbots.codeflixbots["file_store"].find_one(
+                {"access_token": token}
+            )
+        except Exception:
+            logger.exception("File link lookup failed for token %s", token)
+            return await message.reply_text("⚠️ I couldn't access the file store. Please try again later.")
+        if not stored_record:
+            return await message.reply_text("❌ File link not found or no longer available.")
+        try:
+            storage_username = (stored_record.get("storage_chat_username") or "").strip()
+            if storage_username:
+                storage_target = storage_username if storage_username.startswith("@") else "@" + storage_username
+                storage_chat = await client.get_chat(storage_target)
+            else:
+                storage_chat = await client.get_chat(int(stored_record["storage_chat_id"]))
+            stored_message = await client.get_messages(
+                chat_id=storage_chat.id,
+                message_ids=int(stored_record["storage_message_id"]),
+            )
+            stored_media = (
+                getattr(stored_message, "document", None)
+                or getattr(stored_message, "video", None)
+                or getattr(stored_message, "audio", None)
+                or getattr(stored_message, "animation", None)
+                or getattr(stored_message, "photo", None)
+            ) if stored_message else None
+            if not stored_media:
+                return await message.reply_text("❌ The stored file is unavailable. Please contact the bot owner.")
+            await client.copy_message(
+                chat_id=message.chat.id,
+                from_chat_id=storage_chat.id,
+                message_id=int(stored_record["storage_message_id"]),
+            )
+            logger.info("Delivered file-store token %s to user %s", token, user.id)
+        except Exception:
+            logger.exception("Could not deliver stored file for token %s", token)
+            await message.reply_text("⚠️ I couldn't retrieve this file right now. Please try again later.")
+        return
+
     caption = Txt.START_TXT.format(user.mention)
     if Config.START_PIC:
         try:
