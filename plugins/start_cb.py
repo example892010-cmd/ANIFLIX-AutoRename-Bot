@@ -9,6 +9,8 @@ from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, 
 
 from config import Config, Txt
 from helper.database import codeflixbots
+from helper.auth import is_admin_user
+from plugins.force_subs import check_fsub_membership, subscription_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,123 @@ async def _answer(query: CallbackQuery, text: str = "") -> None:
         logger.debug("Callback answer failed", exc_info=True)
 
 
+async def _send_file_link_prompt(client: Client, user_id: int, token: str, missing, errors, prompt_message=None):
+    if errors:
+        text = (
+            "⚠️ File access is temporarily blocked because the bot could not verify one or more "
+            "subscription channels. Please contact the owner or try again later."
+        )
+        keyboard = None
+    else:
+        text = (
+            "🔒 Join the required channel(s) below to access this file.\n\n"
+            "After joining, tap **♻️ Try Again**. If a channel uses join requests, access is available "
+            "after the request is approved."
+        )
+        keyboard = subscription_keyboard(missing, token)
+
+    if prompt_message is not None:
+        try:
+            if prompt_message.media and prompt_message.caption is not None:
+                await prompt_message.edit_caption(caption=text, reply_markup=keyboard)
+            else:
+                await prompt_message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+            return
+        except Exception:
+            logger.debug("Could not edit file access prompt; sending a new message", exc_info=True)
+    await client.send_message(chat_id=int(user_id), text=text, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+async def _deliver_file_token(client: Client, user_id: int, token: str, prompt_message=None, callback_query=None) -> bool:
+    """Verify FSub then deliver only the file matching a saved token."""
+    if not token or len(token) > 60 or not all(ch.isalnum() or ch in "_-" for ch in token):
+        text = "❌ This file link is invalid."
+        if callback_query:
+            await callback_query.answer("Invalid file link.", show_alert=True)
+        await client.send_message(chat_id=int(user_id), text=text)
+        return False
+
+    try:
+        if not is_admin_user(user_id):
+            missing, errors = await check_fsub_membership(client, user_id)
+            if missing or errors:
+                if callback_query:
+                    try:
+                        await callback_query.answer("Please complete subscription verification.", show_alert=bool(errors))
+                    except Exception:
+                        pass
+                await _send_file_link_prompt(client, user_id, token, missing, errors, prompt_message)
+                return False
+    except Exception:
+        logger.exception("Could not verify FSub for user %s", user_id)
+        if callback_query:
+            try:
+                await callback_query.answer("Membership check failed. Try again later.", show_alert=True)
+            except Exception:
+                pass
+        await client.send_message(
+            chat_id=int(user_id),
+            text="⚠️ Membership verification failed. File access is blocked until the bot can verify the required channels.",
+        )
+        return False
+
+    try:
+        stored_record = await codeflixbots.codeflixbots["file_store"].find_one({"access_token": token})
+    except Exception:
+        logger.exception("File link lookup failed for user %s", user_id)
+        await client.send_message(chat_id=int(user_id), text="⚠️ I couldn't access the file store. Please try again later.")
+        return False
+    if not stored_record:
+        await client.send_message(chat_id=int(user_id), text="❌ File link not found or no longer available.")
+        return False
+
+    try:
+        storage_username = (stored_record.get("storage_chat_username") or "").strip()
+        if storage_username:
+            storage_target = storage_username if storage_username.startswith("@") else "@" + storage_username
+            storage_chat = await client.get_chat(storage_target)
+        else:
+            storage_chat = await client.get_chat(int(stored_record["storage_chat_id"]))
+        stored_message = await client.get_messages(
+            chat_id=storage_chat.id,
+            message_ids=int(stored_record["storage_message_id"]),
+        )
+        stored_media = (
+            getattr(stored_message, "document", None)
+            or getattr(stored_message, "video", None)
+            or getattr(stored_message, "audio", None)
+            or getattr(stored_message, "animation", None)
+            or getattr(stored_message, "photo", None)
+        ) if stored_message else None
+        if not stored_media:
+            await client.send_message(chat_id=int(user_id), text="❌ The stored file is unavailable. Please contact the bot owner.")
+            return False
+        await client.copy_message(
+            chat_id=int(user_id),
+            from_chat_id=storage_chat.id,
+            message_id=int(stored_record["storage_message_id"]),
+        )
+        logger.info("Delivered file-store token to user %s", user_id)
+        if callback_query:
+            try:
+                await callback_query.answer("✅ Membership verified. File sent.")
+            except Exception:
+                pass
+            if prompt_message is not None:
+                try:
+                    await prompt_message.edit_text("✅ Membership verified. Your requested file has been sent.", reply_markup=None)
+                except Exception:
+                    pass
+        return True
+    except Exception as exc:
+        logger.exception("Could not deliver stored file to user %s", user_id)
+        await client.send_message(
+            chat_id=int(user_id),
+            text=f"⚠️ I couldn't retrieve this file right now ({type(exc).__name__}). Please try again later.",
+        )
+        return False
+
+
 @Client.on_message(filters.private & filters.command("start"))
 async def start(client: Client, message: Message):
     user = message.from_user
@@ -91,53 +210,16 @@ async def start(client: Client, message: Message):
         )
         return
 
-    # File Store deep links use /start file_<token>. Deliver only the exact file
-    # referenced by a token that exists in the database; never trust user-supplied IDs.
     start_parts = (message.text or "").split(maxsplit=1)
     payload = start_parts[1].strip() if len(start_parts) > 1 else ""
     if payload.startswith("file_"):
-        token = payload[5:]
-        if not token or len(token) > 60 or not all(ch.isalnum() or ch in "_-" for ch in token):
-            return await message.reply_text("❌ This file link is invalid.")
-        try:
-            stored_record = await codeflixbots.codeflixbots["file_store"].find_one(
-                {"access_token": token}
-            )
-        except Exception:
-            logger.exception("File link lookup failed for token %s", token)
-            return await message.reply_text("⚠️ I couldn't access the file store. Please try again later.")
-        if not stored_record:
-            return await message.reply_text("❌ File link not found or no longer available.")
-        try:
-            storage_username = (stored_record.get("storage_chat_username") or "").strip()
-            if storage_username:
-                storage_target = storage_username if storage_username.startswith("@") else "@" + storage_username
-                storage_chat = await client.get_chat(storage_target)
-            else:
-                storage_chat = await client.get_chat(int(stored_record["storage_chat_id"]))
-            stored_message = await client.get_messages(
-                chat_id=storage_chat.id,
-                message_ids=int(stored_record["storage_message_id"]),
-            )
-            stored_media = (
-                getattr(stored_message, "document", None)
-                or getattr(stored_message, "video", None)
-                or getattr(stored_message, "audio", None)
-                or getattr(stored_message, "animation", None)
-                or getattr(stored_message, "photo", None)
-            ) if stored_message else None
-            if not stored_media:
-                return await message.reply_text("❌ The stored file is unavailable. Please contact the bot owner.")
-            await client.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=storage_chat.id,
-                message_id=int(stored_record["storage_message_id"]),
-            )
-            logger.info("Delivered file-store token %s to user %s", token, user.id)
-        except Exception:
-            logger.exception("Could not deliver stored file for token %s", token)
-            await message.reply_text("⚠️ I couldn't retrieve this file right now. Please try again later.")
+        await _deliver_file_token(client, user.id, payload[5:])
         return
+
+    if not is_admin_user(user):
+        return await message.reply_text(
+            "🔒 This bot is for file access only. Open a quality button from an ANIFLIX post to get a file."
+        )
 
     caption = Txt.START_TXT.format(user.mention)
     if Config.START_PIC:
@@ -156,6 +238,17 @@ async def start(client: Client, message: Message):
         reply_markup=home_keyboard(),
         disable_web_page_preview=True,
     )
+
+
+@Client.on_callback_query(filters.regex(r"^check_file_sub:"))
+async def check_file_subscription_callback(client: Client, query: CallbackQuery):
+    data = query.data or ""
+    token = data.partition(":")[2]
+    message = query.message
+    if message is None:
+        await query.answer("Please open the file link again.", show_alert=True)
+        return
+    await _deliver_file_token(client, query.from_user.id, token, prompt_message=message, callback_query=query)
 
 
 @Client.on_callback_query(filters.regex(r"^(home|help|caption|meta|donate|file_names|thumbnail|source|premiumx|plans|about|close|close_data)$"))

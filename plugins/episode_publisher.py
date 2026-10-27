@@ -155,10 +155,14 @@ def _buttons(files: dict[str, Any]) -> InlineKeyboardMarkup:
 def _render_post(route: dict, mode: str, title: str, season: str, episode: str,
                  files: dict[str, Any]) -> str:
     links = {q: files[_quality_field(q)]["url"] for q in EXPECTED_QUALITIES}
+    details = route.get("ongoing_details") or {}
     values = {
         "title": title,
+        "anime": title,
         "season": season,
         "episode": episode,
+        "episode_range": episode,
+        "tag": str(details.get("tag") or ""),
         "qualities": " • ".join(EXPECTED_QUALITIES),
         "quality_480p": links["480p"],
         "quality_720p": links["720p"],
@@ -240,22 +244,45 @@ async def _send_target(client, route: dict, batch: dict, mode: str) -> tuple[boo
     keyboard = _buttons(files)
     poster_file_id = route.get("poster_file_id") if mode == "ongoing" else None
 
-    if poster_file_id:
-        sent = await client.send_photo(
-            chat_id=chat.id,
-            photo=poster_file_id,
-            caption=caption,
-            reply_markup=keyboard,
-            parse_mode=enums.ParseMode.DISABLED,
-        )
-    else:
-        sent = await client.send_message(
-            chat_id=chat.id,
-            text=caption,
-            reply_markup=keyboard,
-            parse_mode=enums.ParseMode.DISABLED,
-            disable_web_page_preview=True,
-        )
+    try:
+        if poster_file_id:
+            sent = await client.send_photo(
+                chat_id=chat.id,
+                photo=poster_file_id,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.HTML,
+            )
+        else:
+            sent = await client.send_message(
+                chat_id=chat.id,
+                text=caption,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        # A malformed user-provided HTML tag should not prevent a valid post from being sent.
+        error_text = str(exc).casefold()
+        if not ("parse entities" in error_text or "can't parse" in error_text or "unsupported start tag" in error_text):
+            raise
+        logger.warning("Template HTML could not be parsed; retrying as plain text: %s", exc)
+        if poster_file_id:
+            sent = await client.send_photo(
+                chat_id=chat.id,
+                photo=poster_file_id,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.DISABLED,
+            )
+        else:
+            sent = await client.send_message(
+                chat_id=chat.id,
+                text=caption,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.DISABLED,
+                disable_web_page_preview=True,
+            )
 
     # Write per-target success immediately so a later target failing cannot cause a duplicate.
     await codeflixbots.codeflixbots["episode_batches"].update_one(
@@ -294,7 +321,9 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
     files = batch.get("files") or {}
     for quality in EXPECTED_QUALITIES:
         entry = files[_quality_field(quality)]
-        token = entry.get("access_token") or secrets.token_hex(8)
+        # A 24-byte URL-safe token provides stronger resistance to guessing than
+        # the old short hex token while remaining valid in Telegram deep-link payloads.
+        token = entry.get("access_token") or secrets.token_urlsafe(24)
         access_url = f"https://t.me/{bot_username}?start=file_{token}"
         entry["access_token"] = token
         entry["url"] = access_url
@@ -336,44 +365,38 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
             "Use /setanimechannels to publish.\n\n" + _link_summary(files)
         )
 
-    targets = [
-        ("individual", route.get("individual_channel")),
-        ("ongoing", route.get("ongoing_channel")),
-    ]
-    configured = [(mode, target) for mode, target in targets if target]
-    if not configured:
+    # Individual episode posts are automatic. Ongoing posts are intentionally separate:
+    # admins trigger them with /ongoing after saving the anime's invite links and template.
+    target = route.get("individual_channel")
+    if not target:
         await codeflixbots.codeflixbots["episode_batches"].update_one(
             {"_id": batch["_id"]},
             {"$set": {"state": "ready_waiting_for_channel", "updated_at": _now()}},
         )
         return (
-            "✅ All 3 files are stored and verified. No publish channel is configured; use /setanimechannels.\n\n"
+            "✅ All 3 files are stored and verified. Links are ready, but this anime has no individual Anime Post channel.\n"
+            "Set one in Admin Panel → Anime Channels. Ongoing posts are manual via /ongoing Anime Title.\n\n"
             + _link_summary(files)
         )
 
     failures = []
-    for mode, _target in configured:
-        try:
-            await _send_target(client, route, batch, mode)
-        except Exception as exc:
-            logger.exception("Could not publish %s post for batch %s", mode, batch["_id"])
-            failures.append(f"{mode}: {type(exc).__name__}: {exc}")
+    try:
+        await _send_target(client, route, batch, "individual")
+    except Exception as exc:
+        logger.exception("Could not publish individual post for batch %s", batch["_id"])
+        failures.append(f"individual: {type(exc).__name__}: {exc}")
 
     refreshed = await codeflixbots.codeflixbots["episode_batches"].find_one({"_id": batch["_id"]}) or batch
     published_targets = refreshed.get("published_targets") or {}
-    all_done = all(
-        published_targets.get(f"{mode}:{route[field]}")
-        for mode, field in (("individual", "individual_channel"), ("ongoing", "ongoing_channel"))
-        if route.get(field)
-    )
+    all_done = bool(published_targets.get(f"individual:{target}"))
     state = "published" if all_done and not failures else "publish_partial"
     await codeflixbots.codeflixbots["episode_batches"].update_one(
         {"_id": batch["_id"]},
         {"$set": {"state": state, "last_error": "\n".join(failures) if failures else None, "updated_at": _now()}},
     )
     if failures:
-        return "⚠️ 3 files are stored, but one or more channel posts failed. No failed target is marked as published; check bot admin permissions and logs."
-    return "✅ All 3 qualities stored and verified. Links generated and episode post(s) published."
+        return "⚠️ 3 files are stored and verified, but the Anime Post channel publish failed. Check bot admin permissions and logs."
+    return "✅ All 3 qualities stored and verified. Anime Post published with inline quality buttons. Use /ongoing Anime Title when you want an ongoing update."
 
 
 async def _find_route_for_batch(batch: dict):
@@ -510,12 +533,8 @@ async def publish_ready_batch(client, batch: dict) -> str:
         if current.get("state") == "published":
             current_route = await _find_route_for_batch(current) or {}
             published_targets = current.get("published_targets") or {}
-            has_unpublished_target = any(
-                current_route.get(field)
-                and not published_targets.get(f"{mode}:{current_route[field]}")
-                for mode, field in (("individual", "individual_channel"), ("ongoing", "ongoing_channel"))
-            )
-            if not has_unpublished_target:
+            target = current_route.get("individual_channel")
+            if not target or published_targets.get(f"individual:{target}"):
                 return "✅ This episode has already been published; duplicate post prevented."
         current_files = current.get("files") or {}
         if not all(current_files.get(_quality_field(q)) for q in EXPECTED_QUALITIES):
@@ -525,10 +544,17 @@ async def publish_ready_batch(client, batch: dict) -> str:
 
 async def _store_file_and_process_locked(client, sent_message, new_filename: str, user_id: int, file_size: int) -> str:
     """Implementation protected by the global store/grouping lock."""
-    storage_setting = os.environ.get("STORAGE_CHANNEL_ID", "").strip()
+    # Keep compatibility with deployments that already used DUMP_CHANNEL, while
+    # preferring the explicit STORAGE_CHANNEL_ID setting for the file store.
+    storage_setting = (
+        os.environ.get("STORAGE_CHANNEL_ID", "").strip()
+        or os.environ.get("FILE_STORE_CHANNEL_ID", "").strip()
+        or os.environ.get("DUMP_CHANNEL", "").strip()
+        or (str(Config.DUMP_CHANNEL) if Config.DUMP_CHANNEL is not None else "")
+    )
     fallback_username = os.environ.get("STORAGE_CHANNEL_USERNAME", "").strip()
     if not storage_setting:
-        return "⚠️ Renaming succeeded, but File Store is not configured (STORAGE_CHANNEL_ID is missing)."
+        return "⚠️ Renaming succeeded, but File Store is not configured. Set STORAGE_CHANNEL_ID (or DUMP_CHANNEL) to the dump channel ID."
 
     storage_target: Any = storage_setting
     if storage_setting.lstrip("-").isdigit():
@@ -736,6 +762,14 @@ async def set_anime_channels(client, message):
                     lookup_target = "@" + lookup_target
                 chat = await client.get_chat(lookup_target)
                 resolved[field] = ("@" + chat.username) if getattr(chat, "username", None) else int(chat.id)
+                me = await client.get_me()
+                bot_member = await client.get_chat_member(chat.id, me.id)
+                bot_status = str(getattr(bot_member, "status", "")).casefold().split(".")[-1]
+                if bot_status not in {"administrator", "creator", "owner"}:
+                    return await message.reply_text(f"❌ The bot must be an administrator in {getattr(chat, 'title', target)} before it can publish there.")
+                if field == "individual_channel" and getattr(bot_member, "privileges", None) is not None:
+                    if not getattr(bot_member.privileges, "can_post_messages", True) and bot_status not in {"creator", "owner"}:
+                        return await message.reply_text("❌ The bot admin role does not have permission to post messages in the Anime Post channel.")
     except Exception as exc:
         return await message.reply_text(
             f"❌ Could not access one of those channels: {type(exc).__name__}: {exc}\n"
@@ -743,11 +777,14 @@ async def set_anime_channels(client, message):
         )
 
     key = _title_key(title)
+    route_fields = {"title": title, "title_key": key, **resolved, "updated_at": _now()}
+    route_update = {"$set": route_fields, "$setOnInsert": {"created_at": _now()}}
+    if ongoing:
+        route_update["$set"]["ongoing_channels"] = [resolved["ongoing_channel"]]
+    else:
+        route_update["$unset"] = {"ongoing_channels": "", "ongoing_channel_titles": ""}
     await codeflixbots.codeflixbots["anime_routes"].update_one(
-        {"title_key": key},
-        {"$set": {"title": title, "title_key": key, **resolved, "updated_at": _now()},
-         "$setOnInsert": {"created_at": _now()}},
-        upsert=True,
+        {"title_key": key}, route_update, upsert=True,
     )
     await message.reply_text(
         f"✅ Channel route saved for {title}.\n"

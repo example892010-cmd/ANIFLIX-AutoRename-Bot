@@ -1,105 +1,101 @@
-"""Optional force-subscribe gate. Disabled when no channels are configured."""
+"""Persistent, per-channel force-subscription settings and membership verification."""
 
 import logging
+from typing import Any
 
-from pyrogram import Client, filters
 from pyrogram.errors import UserNotParticipant
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import Config
+from helper.database import codeflixbots
 
 logger = logging.getLogger(__name__)
-FORCE_SUB_CHANNELS = Config.FORCE_SUB_CHANNELS
-IMAGE_URL = "https://graph.org/file/a27d85469761da836337c.jpg"
+_SETTINGS_ID = "global"
+_MAX_CHANNELS = 6
 
 
-def _is_not_member(member) -> bool:
+def _default_channel(value: Any) -> dict[str, Any]:
+    raw = str(value).strip()
+    if not raw:
+        return {}
+    if raw.lstrip("-").isdigit():
+        return {"chat_id": int(raw), "join_url": "", "mode": "normal", "title": raw}
+    username = raw.lstrip("@").strip()
+    return {"chat_id": "@" + username, "join_url": f"https://t.me/{username}", "mode": "normal", "title": username}
+
+
+async def get_fsub_settings() -> dict[str, Any]:
+    """Read DB settings; migrate the legacy environment list when no DB document exists."""
+    collection = codeflixbots.codeflixbots["fsub_settings"]
+    saved = await collection.find_one({"_id": _SETTINGS_ID})
+    if saved:
+        channels = saved.get("channels") or []
+        return {"enabled": bool(saved.get("enabled", bool(channels))), "channels": channels[:_MAX_CHANNELS]}
+    legacy = [_default_channel(value) for value in (Config.FORCE_SUB_CHANNELS or [])]
+    legacy = [item for item in legacy if item][:_MAX_CHANNELS]
+    return {"enabled": bool(legacy), "channels": legacy}
+
+
+async def save_fsub_settings(settings: dict[str, Any]) -> None:
+    channels = list(settings.get("channels") or [])[:_MAX_CHANNELS]
+    await codeflixbots.codeflixbots["fsub_settings"].update_one(
+        {"_id": _SETTINGS_ID},
+        {"$set": {"enabled": bool(settings.get("enabled", bool(channels))), "channels": channels}},
+        upsert=True,
+    )
+
+
+def _member_is_missing(member) -> bool:
     status = getattr(member, "status", "")
-    status = str(getattr(status, "value", status)).lower().split(".")[-1]
-    return status in {"left", "kicked"}
+    status = str(getattr(status, "value", status)).casefold().split(".")[-1]
+    if status in {"left", "kicked", "banned"}:
+        return True
+    if status == "restricted" and not bool(getattr(member, "is_member", False)):
+        return True
+    return False
 
 
-async def _get_missing_channels(client, user_id: int) -> list[str]:
-    missing = []
-    for channel in FORCE_SUB_CHANNELS:
+async def check_fsub_membership(client, user_id: int) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return (channels still to join, verification errors). Errors fail closed for file delivery."""
+    settings = await get_fsub_settings()
+    if not settings["enabled"] or not settings["channels"]:
+        return [], []
+    missing: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, channel in enumerate(settings["channels"], start=1):
+        target = channel.get("chat_id") or channel.get("username")
+        if target is None or str(target).strip() == "":
+            errors.append(f"Channel {index} has no chat ID configured.")
+            continue
         try:
-            member = await client.get_chat_member(channel, user_id)
-            if _is_not_member(member):
+            member = await client.get_chat_member(target, int(user_id))
+            if _member_is_missing(member):
                 missing.append(channel)
         except UserNotParticipant:
             missing.append(channel)
-        except Exception:
-            # A misconfigured or inaccessible channel should not crash the bot or
-            # accidentally block every user. Log it for the owner to correct.
-            logger.exception("Could not verify force-sub channel %s", channel)
-    return missing
+        except Exception as exc:
+            logger.exception("Force-subscription check failed for channel %s", target)
+            errors.append(f"Channel {channel.get('title') or target}: {type(exc).__name__}")
+    return missing, errors
 
 
-async def not_subscribed(_, client, message):
-    if not FORCE_SUB_CHANNELS or not getattr(message, "from_user", None):
-        return False
-    missing = await _get_missing_channels(client, message.from_user.id)
-    return bool(missing)
-
-
-def _join_url(channel: str) -> str | None:
-    channel = str(channel).strip().lstrip("@")
-    if channel.startswith("-") or channel.lstrip("0123456789") == "":
-        return None
-    return f"https://t.me/{channel}"
-
-
-def _subscription_buttons(channels: list[str]) -> InlineKeyboardMarkup:
+def subscription_keyboard(channels: list[dict[str, Any]], token: str) -> InlineKeyboardMarkup:
     rows = []
-    for channel in channels:
-        url = _join_url(channel)
-        if url:
-            rows.append([InlineKeyboardButton(f"Join {channel}", url=url)])
-    rows.append([InlineKeyboardButton("I've joined — check again", callback_data="check_subscription")])
+    for index, channel in enumerate(channels, start=1):
+        url = (channel.get("join_url") or "").strip()
+        if not url:
+            username = str(channel.get("username") or channel.get("chat_id") or "").strip()
+            if username.startswith("@"):
+                url = "https://t.me/" + username[1:]
+            elif not username.lstrip("-").isdigit() and username:
+                url = "https://t.me/" + username
+        if url.startswith(("https://t.me/", "http://t.me/")):
+            label = str(channel.get("title") or f"Channel {index}")[:50]
+            rows.append([InlineKeyboardButton(f"📢 Join {label}", url=url)])
+    rows.append([InlineKeyboardButton("♻️ Try Again", callback_data=f"check_file_sub:{token}")])
     return InlineKeyboardMarkup(rows)
 
 
-@Client.on_message(filters.private & filters.create(not_subscribed))
-async def forces_sub(client, message):
-    missing = await _get_missing_channels(client, message.from_user.id)
-    if not missing:
-        return
-
-    text = (
-        "You need to join the required channel(s) before using this bot. "
-        "Join them below, then tap ‘I've joined — check again’."
-    )
-    await message.reply_photo(
-        photo=IMAGE_URL,
-        caption=text,
-        reply_markup=_subscription_buttons(missing),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^check_subscription$"))
-async def check_subscription(client, callback_query: CallbackQuery):
-    try:
-        missing = await _get_missing_channels(client, callback_query.from_user.id)
-        if not missing:
-            await callback_query.answer("Subscription verified!")
-            if callback_query.message:
-                await callback_query.message.edit_caption(
-                    caption="✅ Subscription verified. You can now use the bot. Send /start to continue.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("Open bot menu", callback_data="help")
-                    ]]),
-                )
-            return
-
-        await callback_query.answer("Please join all required channels first.", show_alert=True)
-        if callback_query.message:
-            await callback_query.message.edit_caption(
-                caption="You still need to join the required channel(s) below.",
-                reply_markup=_subscription_buttons(missing),
-            )
-    except Exception:
-        logger.exception("Force-subscription verification failed")
-        try:
-            await callback_query.answer("Couldn't verify membership. Please try again.", show_alert=True)
-        except Exception:
-            pass
+def is_admin(user_id: int) -> bool:
+    from helper.auth import is_admin_user
+    return is_admin_user(user_id)
