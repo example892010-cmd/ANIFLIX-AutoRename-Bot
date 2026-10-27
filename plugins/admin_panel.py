@@ -499,13 +499,30 @@ async def handle_admin_session_input(client: Client, message: Message):
     data = session.get("data") or {}
     try:
         if stage in {"route_add", "route_edit"}:
+            # Simple format: Anime Title | Individual Channel ID/@username
+            # Optional third field assigns ongoing destinations. If omitted, preserve
+            # any existing ongoing assignment instead of clearing it accidentally.
             parts = [part.strip() for part in (message.text or "").split("|", 2)]
-            if len(parts) != 3 or not parts[0]:
-                raise ValueError("Use exactly: Anime Title | Individual Channel ID/@username/- | Ongoing Channel IDs/@usernames separated by commas/-")
-            await _save_route_targets(client, parts[0], parts[1], parts[2])
+            if len(parts) not in (2, 3) or not parts[0] or not parts[1]:
+                raise ValueError(
+                    "Use: Anime Title | Individual Channel ID/@username\n"
+                    "Example: Naruto | -1003965317344\n"
+                    "Optional ongoing channels: Naruto | -1003965317344 | -1003693662050,-1003528863118\n"
+                    "Use - as the individual channel only if you want to clear it."
+                )
+            ongoing_raw = parts[2] if len(parts) == 3 else None
+            if ongoing_raw is None:
+                existing = await _find_route(parts[0])
+                ongoing_values = (existing or {}).get("ongoing_channels") or []
+                if not ongoing_values and (existing or {}).get("ongoing_channel"):
+                    ongoing_values = [(existing or {}).get("ongoing_channel")]
+                ongoing_raw = ",".join(map(str, ongoing_values)) if ongoing_values else "-"
+            await _save_route_targets(client, parts[0], parts[1], ongoing_raw)
             await _clear_admin_state(user.id)
             await message.reply_text(
-                f"✅ Channel assignment saved for {parts[0]}.\nAnime Post: {parts[1] or 'Not set'}\nOngoing destinations: {parts[2] or 'Not set'}",
+                f"✅ Anime channel saved for {parts[0]}.\n"
+                f"Anime Post channel: {parts[1]}\n"
+                f"Ongoing channels: {ongoing_raw if ongoing_raw != '-' else 'Not set'}",
                 reply_markup=_admin_main_keyboard(),
             )
 
@@ -897,9 +914,9 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
         except Exception:
             await query.message.reply_text(titles[action], reply_markup=_menu_keyboard(keyboard_key), disable_web_page_preview=True)
     elif action == "route_add":
-        await _prompt(client, user.id, "route_add", "Send: Anime Title | Individual Channel ID/@username/- | Ongoing Channel IDs/@usernames separated by commas/-")
+        await _prompt(client, user.id, "route_add", "Send: Anime Title | Individual Channel ID/@username\nExample: Naruto | -1003965317344\nOptional: add | OngoingChannelID1,OngoingChannelID2 as a third field.")
     elif action == "route_edit":
-        await _prompt(client, user.id, "route_edit", "Send: Anime Title | Individual Channel ID/@username/- | Ongoing Channel IDs/@usernames separated by commas/-. Use - to clear a destination.")
+        await _prompt(client, user.id, "route_edit", "Send: Anime Title | Individual Channel ID/@username\nExample: Naruto | -1003965317344\nOptional third field: ongoing channel IDs separated by commas. If omitted, existing ongoing assignments stay unchanged.")
     elif action == "route_remove":
         await _prompt(client, user.id, "route_remove", "Send the anime title whose channel assignments you want to remove. Templates/poster are kept.")
     elif action == "route_list":
