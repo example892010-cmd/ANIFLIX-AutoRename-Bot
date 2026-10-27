@@ -51,6 +51,38 @@ def extract_quality(filename: str) -> str:
     return "Unknown"
 
 
+def canonical_quality(filename_or_quality: str) -> str | None:
+    """Return one of the three supported publication qualities, or None."""
+    raw = str(filename_or_quality or "").strip().lower()
+    if raw in {"480p", "720p", "1080p"}:
+        return raw
+    quality = extract_quality(raw).lower()
+    return quality if quality in {"480p", "720p", "1080p"} else None
+
+
+def normalize_anime_title(value: str) -> str:
+    """Normalize a title for safe exact matching between files and channel routes."""
+    text = source_basename(str(value or "")).strip()
+    # Strip only known media extensions; anime titles may contain periods (e.g. Dr. Stone).
+    if re.search(r"(?i)\.(?:mp4|mkv|mov|webm|avi|m4v|ts|mpeg|mpg|wmv|flv|3gp|ogv|vob|mts|m2ts|mp3|m4a|aac|flac|wav|ogg|opus|wma|alac|aiff)$", text):
+        text = Path(text).stem
+    # Strip the common ANIFLIX branding prefix used in rename templates.
+    text = re.sub(
+        r"(?i)^\s*@?aniflix(?:\s+network)?(?:\s+tamil)?\s*[-|:]+\s*",
+        "",
+        text,
+    )
+    text = re.sub(r"(?i)^\s*@?aniflixanimetamil\s*[-|:]+\s*", "", text)
+    text = re.sub(r"(?i)\b(?:S(?:eason)?[ ._-]*\d{1,2}[ ._-]*E(?:P|pisode)?[ ._-]*\d{1,3}|Season[ ._-]*\d{1,2}[ ._-]*Episode[ ._-]*\d{1,3}|(?:Episode|EP|E)[ ._-]*\d{1,3})\b", " ", text)
+    text = re.sub(r"(?i)\b(2160p|1440p|1080p|720p|480p|360p|240p|4k|8k|2k)\b", " ", text)
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", text)
+    text = text.replace("@ANIFLIXANIMETAMIL", " ")
+    text = re.sub(r"[._]+", " ", text)
+    text = re.sub(r"[^\w\s'-]", " ", text, flags=re.UNICODE)
+    text = _WHITESPACE.sub(" ", text).strip(" .-_[]()")
+    return text.casefold()
+
+
 def extract_title(filename: str) -> str:
     """Build a useful title by removing recognizable release metadata."""
     stem = Path(source_basename(filename)).stem
