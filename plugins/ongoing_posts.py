@@ -13,13 +13,12 @@ from helper.file_names import normalize_anime_title
 
 logger = logging.getLogger(__name__)
 DEFAULT_ONGOING_TEMPLATE = (
-    "✦ <b>{anime}</b>\n"
-    "╭━━━━━━━━━━━━━━━━━━━━━━\n"
+    "✦ {title}╭━━━━━━━━━━━━━━━━━━━━━━\n"
     "‣ Season : {season}\n"
-    "‣ Episode : {episode_range} {tag}\n"
+    "‣ Episode : {episode_range}\n"
     "‣ Status : {status}\n"
-    "‣ Quality : {qualities}\n"
-    "╰━━━━━━━━━━━━━━━━━━━━━━\n"
+    "‣ Audio : [Tamil Audio]\n"
+    "‣ Quality : {qualities}╰━━━━━━━━━━━━━━━━━━━━━━\n"
     "✦ Powered By : @ANIFLIXANIMETAMIL"
 )
 
@@ -96,6 +95,10 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
 
     details = route.get("ongoing_details") or {}
     qualities = details.get("qualities") or "480p, 720p, 1080p"
+    post_settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
+    # Named Templates hold the poster matched by the normalized anime name. The post
+    # text comes from one global Main Ongoing Post Text setting shared by all anime.
+    saved_template = await codeflixbots.codeflixbots["anime_templates"].find_one({"_id": key}) or {}
     values = {
         "anime": route.get("title") or title,
         "title": route.get("title") or title,
@@ -103,12 +106,12 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
         "episode_range": details.get("episode_range") or "—",
         "episode": details.get("episode_range") or "—",
         "tag": details.get("tag") or "",
-        "status": details.get("status") or "ONGOING [Tamil Audio]",
+        "status": details.get("status") or "ONGOING",
         "qualities": qualities,
         "audio": "Tamil Audio",
     }
-    template = route.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
-    poster = route.get("poster_file_id")
+    template = post_settings.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
+    poster = saved_template.get("poster_file_id") or route.get("poster_file_id")
     # Telegram photo captions are limited to 1024 characters; text posts can be longer.
     caption = _render_template(template, values, limit=1024 if poster else 4096)
 
@@ -176,7 +179,7 @@ async def ongoing_command(client: Client, message: Message):
         return await message.reply_text("⛔ Admin only.")
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
-        return await message.reply_text("Usage: `/ongoing Anime Title`\n\nThe bot uses that anime's saved poster, ongoing template, invite links, and assigned ongoing channel(s).")
+        return await message.reply_text("Usage: `/ongoing Anime Title`\n\nThe bot uses that anime's saved poster and invite links, plus the shared Main Ongoing Post Text.")
     try:
         result = await post_ongoing_anime(client, parts[1].strip())
     except Exception as exc:

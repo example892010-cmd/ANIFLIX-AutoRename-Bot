@@ -7,11 +7,12 @@ import re
 import shutil
 import tempfile
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
-from pyrogram import Client, enums, filters
+from pyrogram import Client, enums, filters, StopPropagation
 from pyrogram.errors import FloodWait
 
 from helper.database import codeflixbots
@@ -22,6 +23,7 @@ from helper.file_names import (
     metadata_enabled,
     render_filename,
     source_basename,
+    sanitize_filename,
 )
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
@@ -50,6 +52,118 @@ def extract_quality_compat(filename):
     """Compatibility wrapper kept for any local extensions importing this helper."""
     return extract_quality(filename)
 
+
+
+# Each uploaded file waits for its own three-line details before processing. Per-user
+# queues ensure a later upload is not renamed/stored/published until the prior one ends.
+_MEDIA_QUEUES = defaultdict(list)
+_MEDIA_WAITING_DETAILS = set()
+_MEDIA_PROCESSING = set()
+
+
+def _parse_upload_details(text: str) -> dict | None:
+    raw = (text or "").strip()
+    if "|" in raw and len(raw.splitlines()) == 1:
+        parts = [part.strip() for part in raw.split("|", 2)]
+    else:
+        parts = [part.strip() for part in raw.splitlines() if part.strip()]
+    if len(parts) != 3 or not parts[0]:
+        return None
+    title, raw_season, raw_episode = parts
+    season_match = re.search(r"(?i)\bseason\s*(\d{1,2})\b|^\s*(\d{1,2})\s*$", raw_season)
+    if not season_match:
+        return None
+    season = season_match.group(1) or season_match.group(2)
+    episode_match = re.fullmatch(r"\s*(?:Episode\s*)?(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*", raw_episode, re.I)
+    if not episode_match:
+        return None
+    first = str(int(episode_match.group(1)))
+    last = str(int(episode_match.group(2))) if episode_match.group(2) else None
+    if last and int(last) < int(first):
+        return None
+    episode_range = f"{first}-{last}" if last and last != first else first
+    return {"title": title, "season": str(int(season)), "episode_range": episode_range}
+
+
+def _render_filename_for_details(original_filename: str, template: str, details: dict) -> str:
+    """Render a filename using the user's supplied anime/season/episode details."""
+    original = source_basename(original_filename)
+    extension = Path(original).suffix
+    quality = extract_quality(original)
+    # Some uploaded files omit quality in their filename; retain the existing behaviour.
+    values = {
+        "title": str(details["title"]).strip(),
+        "season": str(details["season"]).strip(),
+        "episode": str(details["episode_range"]).strip(),
+        "quality": quality,
+    }
+    text = str(template or "{title} S{season} Ep{episode} [{quality}]").strip()
+    text = re.sub(r"(?i)\bSseason\b", "S{season}", text)
+    text = re.sub(r"(?i)\bEepisode\b", "E{episode}", text)
+    text = re.sub(r"(?i)(?<!\{)\bquality\b(?!\})", "{quality}", text)
+    text = re.sub(
+        r"\{\s*(title|season|episode|quality)\s*\}",
+        lambda match: values[match.group(1).lower()],
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\{[^{}]*\}", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    text = re.sub(r"\[\s*\]|\(\s*\)", "", text)
+    if extension and not text.lower().endswith(extension.lower()):
+        text += extension
+    return sanitize_filename(text)
+
+
+async def _prompt_for_next_file(client, user_id: int):
+    queue = _MEDIA_QUEUES.get(user_id) or []
+    if queue and user_id not in _MEDIA_WAITING_DETAILS and user_id not in _MEDIA_PROCESSING:
+        _MEDIA_WAITING_DETAILS.add(user_id)
+        await queue[0].reply_text(
+            "📝 Send the details for this file in 3 lines:\n"
+            "Anime Name\nSeason 17\n335-336\n\n"
+            "The bot will start renaming only after you send these details."
+        )
+
+
+@Client.on_message(filters.private & filters.text, group=-8)
+async def collect_upload_details(client: Client, message):
+    user = getattr(message, "from_user", None)
+    if not user or user.id not in _MEDIA_WAITING_DETAILS:
+        return
+    text = (message.text or "").strip()
+    if re.match(r"^/cancel(?:@\w+)?(?:\s|$)", text, re.I):
+        _MEDIA_WAITING_DETAILS.discard(user.id)
+        _MEDIA_QUEUES.pop(user.id, None)
+        await message.reply_text("✅ Waiting file queue cancelled. Your original files were not renamed.")
+        raise StopPropagation
+    details = _parse_upload_details(text)
+    if not details:
+        await message.reply_text(
+            "❌ I couldn't read those details. Send exactly 3 lines, for example:\n"
+            "Naruto Shippuden\nSeason 17\n335-336"
+        )
+        raise StopPropagation
+    queue = _MEDIA_QUEUES.get(user.id) or []
+    if not queue:
+        _MEDIA_WAITING_DETAILS.discard(user.id)
+        return
+    current = queue[0]
+    _MEDIA_WAITING_DETAILS.discard(user.id)
+    _MEDIA_PROCESSING.add(user.id)
+    try:
+        await auto_rename_files(client, current, _details=details)
+    finally:
+        queue = _MEDIA_QUEUES.get(user.id) or []
+        if queue:
+            queue.pop(0)
+        _MEDIA_PROCESSING.discard(user.id)
+        if queue:
+            await _prompt_for_next_file(client, user.id)
+        else:
+            _MEDIA_QUEUES.pop(user.id, None)
+            _MEDIA_WAITING_DETAILS.discard(user.id)
+    raise StopPropagation
 
 async def process_thumbnail(thumb_path: str | None) -> str | None:
     """Create a Telegram-friendly JPEG thumbnail (maximum 320x320, under 200 KB)."""
@@ -144,12 +258,19 @@ async def _get_thumbnail_path(client, message, user_id: int, work_dir: str) -> s
 
 
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
-async def auto_rename_files(client, message):
-    """Rename incoming private-chat media according to the user's saved template."""
+async def auto_rename_files(client, message, _details: dict | None = None):
+    """Queue an upload, then rename only after the user provides anime details."""
     user = getattr(message, "from_user", None)
     if user is None:
         return
     user_id = user.id
+    if _details is None:
+        queue = _MEDIA_QUEUES[user_id]
+        if not any(getattr(item, "id", None) == getattr(message, "id", None) for item in queue):
+            queue.append(message)
+        if user_id not in _MEDIA_WAITING_DETAILS and user_id not in _MEDIA_PROCESSING:
+            await _prompt_for_next_file(client, user_id)
+        return
 
     try:
         format_template = await codeflixbots.get_format_template(user_id)
@@ -206,7 +327,7 @@ async def auto_rename_files(client, message):
     started_at = time.perf_counter()
     timings = {}
     try:
-        new_filename = render_filename(original_name, format_template)
+        new_filename = _render_filename_for_details(original_name, format_template, _details)
         extension = Path(original_name).suffix.lower()
         if not re.fullmatch(r"\.[a-z0-9]{1,10}", extension):
             extension = ""
@@ -312,6 +433,7 @@ async def auto_rename_files(client, message):
                     new_filename=new_filename,
                     user_id=user_id,
                     file_size=file_size,
+                    details=_details,
                 )
             except Exception as storage_exc:
                 logger.exception("Renamed file could not be stored/processed for user %s", user_id)

@@ -125,6 +125,8 @@ ADMIN_STATE_COLLECTION = "admin_sessions"
 ROUTES_COLLECTION = "anime_routes"
 INVITES_COLLECTION = "anime_invite_links"
 ONGOING_CHANNELS_COLLECTION = "ongoing_channel_settings"
+TEMPLATES_COLLECTION = "anime_templates"
+POST_TEMPLATES_COLLECTION = "post_template_settings"
 FSUB_COLLECTION = "fsub_settings"
 MAX_ONGOING_CHANNELS = 6
 MAX_FSUB_CHANNELS = 6
@@ -164,10 +166,9 @@ def _admin_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📺 Anime Channels", callback_data="adm:anime_channels"), InlineKeyboardButton("🔗 Anime Invite Links", callback_data="adm:invites")],
         [InlineKeyboardButton("🎬 Episode Manager", callback_data="adm:episode_manager"), InlineKeyboardButton("✅ Link Verification", callback_data="adm:verify_links")],
-        [InlineKeyboardButton("📝 Post Customization", callback_data="adm:post_customization")],
-        [InlineKeyboardButton("📝 Anime Post", callback_data="adm:anime_post"), InlineKeyboardButton("🖼 Ongoing Post", callback_data="adm:ongoing_post")],
+        [InlineKeyboardButton("📚 Templates", callback_data="adm:templates"), InlineKeyboardButton("📝 Post Text", callback_data="adm:post_customization")],
         [InlineKeyboardButton("📡 Ongoing Channels", callback_data="adm:ongoing_channels"), InlineKeyboardButton("🔒 Force Subscribe", callback_data="adm:fsub")],
-        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings"), InlineKeyboardButton("📋 Ongoing Details", callback_data="adm:set_ongoing_details")],
+        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings")],
         [InlineKeyboardButton("🚀 Publish Ongoing", callback_data="adm:publish_ongoing")],
     ])
 
@@ -207,8 +208,15 @@ def _menu_keyboard(menu: str):
         ]
     elif menu == "post_customization":
         rows = [
-            [InlineKeyboardButton("📝 Anime Post Template", callback_data="adm:anime_post")],
-            [InlineKeyboardButton("🖼 Ongoing Post + Poster", callback_data="adm:ongoing_post")],
+            [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
+            [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
+        ]
+    elif menu == "templates":
+        rows = [
+            [InlineKeyboardButton("➕ Create Template", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Template", callback_data="adm:template_edit")],
+            [InlineKeyboardButton("📋 View Templates", callback_data="adm:template_list")],
+            [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
+            [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
         ]
     else:
         rows = []
@@ -454,6 +462,20 @@ async def _ongoing_channels_text():
     return "\n".join(lines)
 
 
+async def _global_post_templates():
+    collection = codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION]
+    doc = await collection.find_one({"_id": "global"})
+    return doc or {}
+
+
+async def _saved_templates_text():
+    cursor = codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find({}).sort("title", 1).limit(100)
+    lines = ["📚 Saved Anime Templates"]
+    async for item in cursor:
+        lines.append(f"• {item.get('title', '(unnamed)')} — {'Poster saved' if item.get('poster_file_id') else 'No poster'}")
+    return "\n".join(lines) if len(lines) > 1 else "No templates saved yet. Tap Create Template to add one."
+
+
 @Client.on_message(filters.private & filters.command("admin"))
 async def admin_dashboard(client: Client, message: Message):
     if not is_admin_user(getattr(message, "from_user", None)):
@@ -520,6 +542,72 @@ async def handle_admin_session_input(client: Client, message: Message):
             )
             await _clear_admin_state(user.id)
             await message.reply_text("✅ Channel assignments removed." if result.modified_count else "No matching anime channel assignment was found.", reply_markup=_admin_main_keyboard())
+
+        elif stage == "template_create_name":
+            title = (message.text or "").strip()
+            if not title:
+                raise ValueError("Send a non-empty template name, e.g. Naruto Shippuden.")
+            key = _title_key(title)
+            await _set_admin_state(user.id, "template_create_poster", {"title": title, "title_key": key})
+            await message.reply_text(f"Send me the poster of the template: {title}. Send it as a photo.")
+
+        elif stage == "template_create_poster":
+            title, key = data.get("title", ""), data.get("title_key", "")
+            if not message.photo:
+                raise ValueError("Please send the template poster as a Telegram photo.")
+            poster_id = message.photo[-1].file_id
+            await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one(
+                {"_id": key},
+                {"$set": {"title": title, "title_key": key, "poster_file_id": poster_id, "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            # Keep the old route poster field populated for backward compatibility.
+            await _route_collection().update_one(
+                {"title_key": key},
+                {"$set": {"title": title, "title_key": key, "poster_file_id": poster_id, "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text(f"✅ Template saved: {title}. Its poster will be selected automatically by anime name. The ongoing post text is shared globally.", reply_markup=_admin_main_keyboard())
+
+        elif stage == "template_edit_name":
+            title = (message.text or "").strip()
+            key = _title_key(title)
+            doc = await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find_one({"_id": key})
+            if not doc:
+                raise ValueError(f"No saved template named {title!r}. Use Templates → View Templates to see saved names.")
+            await _set_admin_state(user.id, "template_edit_poster", {"title": doc.get("title") or title, "title_key": key})
+            await message.reply_text(f"Send the new poster for {doc.get('title') or title}, or send KEEP to keep its current poster.")
+
+        elif stage == "template_edit_poster":
+            title, key = data.get("title", ""), data.get("title_key", "")
+            if (message.text or "").strip().casefold() == "keep":
+                await _clear_admin_state(user.id)
+                await message.reply_text(f"✅ Kept the saved poster for {title}.", reply_markup=_admin_main_keyboard())
+            elif message.photo:
+                poster_id = message.photo[-1].file_id
+                await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one({"_id": key}, {"$set": {"poster_file_id": poster_id, "updated_at": _now_utc()}})
+                await _route_collection().update_one({"title_key": key}, {"$set": {"poster_file_id": poster_id, "updated_at": _now_utc()}}, upsert=True)
+                await _clear_admin_state(user.id)
+                await message.reply_text(f"✅ Poster updated for {title}.", reply_markup=_admin_main_keyboard())
+            else:
+                raise ValueError("Send a poster photo or type KEEP.")
+
+        elif stage in {"main_ongoing_text", "anime_post_text"}:
+            template = _formatted_message_content(message)
+            if not template:
+                raise ValueError("Template text cannot be empty. Send the post text, either as text or as a photo caption.")
+            if len(template) > 4000:
+                raise ValueError("Keep the text template under 4000 characters.")
+            field = "ongoing_template" if stage == "main_ongoing_text" else "anime_post_template"
+            await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].update_one(
+                {"_id": "global"},
+                {"$set": {field: template, "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            label = "Main Ongoing Post Text" if field == "ongoing_template" else "Anime Post Text"
+            await message.reply_text(f"✅ {label} saved. This text template is shared across all anime; placeholders will be replaced automatically.", reply_markup=_admin_main_keyboard())
 
         elif stage == "anime_template_name":
             title = (message.text or "").strip()
@@ -881,7 +969,7 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             await query.message.edit_text("🍥 **ANIFLIX AUTO-RENAME BOT — ADMIN PANEL**\n\nChoose a section below.", reply_markup=_admin_main_keyboard())
         except Exception:
             await query.message.reply_text("ANIFLIX Auto-Rename Bot — Admin Panel", reply_markup=_admin_main_keyboard())
-    elif action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization"}:
+    elif action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "templates"}:
         titles = {
             "anime_channels": "📺 ANIME CHANNELS — Add, edit, remove, or view each anime's individual and ongoing destinations.",
             "invites": "🔗 ANIME INVITE LINKS — Manage the buttons used in manual ongoing posts.",
@@ -889,9 +977,10 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             "fsub": await _fsub_text(),
             "episode_manager": "🎬 EPISODE MANAGER — Inspect saved groups and repair legacy split groups.",
             "settings": "⚙️ BOT SETTINGS — Force Subscribe and channel configuration.",
-            "post_customization": "📝 POST CUSTOMIZATION — Save templates and posters per anime.",
+            "post_customization": "📝 POST TEXT — Configure the shared Main Ongoing Post Text and shared Anime Post Text.",
+            "templates": await _saved_templates_text(),
         }
-        keyboard_key = action if action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization"} else "settings"
+        keyboard_key = action if action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "templates"} else "settings"
         try:
             await query.message.edit_text(titles[action], reply_markup=_menu_keyboard(keyboard_key), disable_web_page_preview=True)
         except Exception:
@@ -912,10 +1001,18 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
         await _prompt(client, user.id, "invite_remove", "Send: Anime Title | Button Name (or ALL to remove all links for that anime).")
     elif action == "invite_view":
         await _prompt(client, user.id, "invite_view", "Send the anime title whose saved invite links you want to view.")
-    elif action == "anime_post":
-        await _prompt(client, user.id, "anime_template_name", "Send the anime title whose Anime Post template you want to save.")
+    elif action in {"template_create"}:
+        await _prompt(client, user.id, "template_create_name", "Send the template name exactly as the anime name, e.g. Naruto Shippuden.")
+    elif action in {"template_edit"}:
+        await _prompt(client, user.id, "template_edit_name", "Send the exact name of the saved template you want to edit.")
+    elif action == "template_list":
+        await client.send_message(user.id, await _saved_templates_text(), reply_markup=_menu_keyboard("templates"))
+    elif action == "main_ongoing_text":
+        await _prompt(client, user.id, "main_ongoing_text", "Send the shared Main Ongoing Post Text. This text is used for every anime; placeholders such as {title}, {season}, {episode_range}, {status}, and {qualities} are replaced automatically.")
+    elif action in {"anime_post_text", "anime_post"}:
+        await _prompt(client, user.id, "anime_post_text", "Send the shared text-only Anime Post template. No poster is used for Anime Posts. Placeholders: {anime}, {title}, {season}, {episode_range}, {qualities}.")
     elif action == "ongoing_post":
-        await _prompt(client, user.id, "ongoing_template_name", "Send the anime title whose Ongoing Post template and poster you want to save.")
+        await _prompt(client, user.id, "main_ongoing_text", "Send the shared Main Ongoing Post Text for all anime. Posters are saved separately in Templates under each anime name.")
     elif action == "publish_ongoing":
         await _prompt(client, user.id, "publish_ongoing", "Send the anime title to publish now, e.g. Naruto Shippuden. Saved invite links and its ongoing template will be used.")
     elif action == "set_ongoing_details":

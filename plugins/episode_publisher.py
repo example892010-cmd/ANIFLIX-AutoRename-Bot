@@ -35,12 +35,19 @@ _BATCH_LOCKS: dict[str, asyncio.Lock] = {}
 _STORE_PROCESS_LOCK = asyncio.Lock()
 
 DEFAULT_INDIVIDUAL_TEMPLATE = (
-    "⬡ {title} | Official Tamil Dub\n\n"
-    "⬡ Quality : {qualities}\n\n"
-    "⬡ Season : {season} | ⬡ Episode : {episode} 👇\n\n"
-    "FOR MORE ANIMES @ANIFLIXANIMETAMIL"
+    "⌬ {anime} | Official Tamil Dub\n\n"
+    "⌬ Quality : {qualities}\n\n"
+    "⌬ Season : {season} | ⌬ Episode : {episode_range}👇"
 )
-DEFAULT_ONGOING_TEMPLATE = DEFAULT_INDIVIDUAL_TEMPLATE
+DEFAULT_ONGOING_TEMPLATE = (
+    "✦ {title}╭━━━━━━━━━━━━━━━━━━━━━━\n"
+    "‣ Season : {season}\n"
+    "‣ Episode : {episode_range}\n"
+    "‣ Status : {status}\n"
+    "‣ Audio : [Tamil Audio]\n"
+    "‣ Quality : {qualities}╰━━━━━━━━━━━━━━━━━━━━━━\n"
+    "✦ Powered By : @ANIFLIXANIMETAMIL"
+)
 
 
 def _now():
@@ -163,7 +170,7 @@ def _render_post(route: dict, mode: str, title: str, season: str, episode: str,
         "episode": episode,
         "episode_range": episode,
         "tag": str(details.get("tag") or ""),
-        "qualities": " • ".join(EXPECTED_QUALITIES),
+        "qualities": ", ".join(EXPECTED_QUALITIES),
         "quality_480p": links["480p"],
         "quality_720p": links["720p"],
         "quality_1080p": links["1080p"],
@@ -171,7 +178,7 @@ def _render_post(route: dict, mode: str, title: str, season: str, episode: str,
         "link_720p": links["720p"],
         "link_1080p": links["1080p"],
         "audio": "Tamil Audio",
-        "status": "Tamil Audio",
+        "status": str(details.get("status") or "ONGOING"),
     }
     key = "individual_template" if mode == "individual" else "ongoing_template"
     fallback = DEFAULT_INDIVIDUAL_TEMPLATE if mode == "individual" else DEFAULT_ONGOING_TEMPLATE
@@ -187,10 +194,14 @@ async def _verify_batch_files(client, batch: dict) -> tuple[bool, str]:
         if canonical_quality(entry.get("filename", "")) != quality:
             return False, f"The filename for the {quality} slot does not match that quality."
         entry_season, entry_episode = extract_season_episode(entry.get("filename", ""))
-        if (not entry_season or not entry_episode
-                or str(int(entry_season)) != str(batch.get("season"))
-                or str(int(entry_episode)) != str(batch.get("episode"))):
-            return False, f"The {quality} filename does not match the saved season/episode."
+        expected_episode_start = str(batch.get("episode", "")).split("-", 1)[0].strip()
+        try:
+            episode_matches = bool(entry_episode) and int(entry_episode) == int(expected_episode_start)
+            season_matches = bool(entry_season) and int(entry_season) == int(batch.get("season"))
+        except (TypeError, ValueError):
+            episode_matches = season_matches = False
+        if not (season_matches and episode_matches):
+            return False, f"The {quality} filename does not match the saved season/episode range."
         if not _titles_match(extract_title(entry.get("filename", "")), batch.get("title", batch.get("title_key", ""))):
             return False, f"The {quality} filename does not match the saved anime title."
         try:
@@ -240,9 +251,18 @@ async def _send_target(client, route: dict, batch: dict, mode: str) -> tuple[boo
     season = batch["season"]
     episode = batch["episode"]
     files = batch["files"]
+    global_templates = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
+    route = dict(route)
+    if mode == "individual":
+        route["individual_template"] = global_templates.get("anime_post_template") or DEFAULT_INDIVIDUAL_TEMPLATE
+    else:
+        route["ongoing_template"] = global_templates.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
     caption = _render_post(route, mode, title, season, episode, files)
     keyboard = _buttons(files)
-    poster_file_id = route.get("poster_file_id") if mode == "ongoing" else None
+    poster_file_id = None
+    if mode == "ongoing":
+        named_template = await codeflixbots.codeflixbots["anime_templates"].find_one({"_id": _title_key(title)}) or {}
+        poster_file_id = named_template.get("poster_file_id") or route.get("poster_file_id")
 
     try:
         if poster_file_id:
@@ -542,7 +562,7 @@ async def publish_ready_batch(client, batch: dict) -> str:
         return await _publish_ready_batch_locked(client, current)
 
 
-async def _store_file_and_process_locked(client, sent_message, new_filename: str, user_id: int, file_size: int) -> str:
+async def _store_file_and_process_locked(client, sent_message, new_filename: str, user_id: int, file_size: int, details: dict | None = None) -> str:
     """Implementation protected by the global store/grouping lock."""
     # Keep compatibility with deployments that already used DUMP_CHANNEL, while
     # preferring the explicit STORAGE_CHANNEL_ID setting for the file store.
@@ -582,6 +602,22 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
     season, episode = extract_season_episode(new_filename)
     quality = canonical_quality(new_filename) or "Unknown"
     title = extract_title(new_filename)
+    if details:
+        title = str(details.get("title") or title).strip()
+        season = str(details.get("season") or season or "").strip()
+        episode = str(details.get("episode_range") or episode or "").strip()
+    try:
+        season = str(int(str(season).strip())) if season else None
+    except (ValueError, TypeError):
+        season = None
+    if episode:
+        range_match = re.fullmatch(r"\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*", str(episode))
+        if range_match:
+            first_ep = str(int(range_match.group(1)))
+            last_ep = str(int(range_match.group(2))) if range_match.group(2) else None
+            episode = f"{first_ep}-{last_ep}" if last_ep and last_ep != first_ep else first_ep
+        else:
+            episode = None
     title_key = _title_key(title)
     created_at = _now()
     logger.info(
@@ -630,7 +666,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
             + ", ".join(missing) + "."
         )
 
-    group_id = _batch_id(title_key, str(int(season)), str(int(episode)))
+    group_id = _batch_id(title_key, str(season), str(episode))
     quality_key = _quality_field(quality)
     group_file = {
         "quality": quality,
@@ -651,8 +687,8 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
         group_id,
         title,
         title_key,
-        str(int(season)),
-        str(int(episode)),
+        str(season),
+        str(episode),
     )
     if match_status == "published" or (existing and existing.get("state") == "published"):
         return f"✅ File saved. This episode has already been published; duplicate {quality} was not published again."
@@ -668,8 +704,8 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
             "$setOnInsert": {
                 "title": title,
                 "title_key": title_key,
-                "season": str(int(season)),
-                "episode": str(int(episode)),
+                "season": str(season),
+                "episode": str(episode),
                 "created_at": created_at,
                 "published_targets": {},
             },
@@ -698,7 +734,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
     return result
 
 
-async def store_file_and_process(client, sent_message, new_filename: str, user_id: int, file_size: int) -> str:
+async def store_file_and_process(client, sent_message, new_filename: str, user_id: int, file_size: int, details: dict | None = None) -> str:
     """Serialize stored-file writes and episode grouping across concurrent uploads."""
     async with _STORE_PROCESS_LOCK:
         return await _store_file_and_process_locked(
@@ -707,6 +743,7 @@ async def store_file_and_process(client, sent_message, new_filename: str, user_i
             new_filename=new_filename,
             user_id=user_id,
             file_size=file_size,
+            details=details,
         )
 
 
