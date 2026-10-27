@@ -96,6 +96,9 @@ def extract_title(filename: str) -> str:
     stem = re.sub(r"(?<![\w])@[A-Za-z0-9_]{2,}", " ", stem)
     # Remove common trailing release-group / channel fragments after metadata removal.
     stem = re.sub(r"(?i)\b(by|uploaded\s+by|source)\s*[:_-]?\s*$", " ", stem)
+    # The parser intentionally exposes a start episode for a range (e.g. E335-336).
+    # Remove the remaining trailing range endpoint before deriving the anime title.
+    stem = re.sub(r"\s*[-–]\s*\d{1,3}\b\s*$", " ", stem)
     stem = re.sub(r"[._]+", " ", stem)
     stem = _WHITESPACE.sub(" ", stem).strip(" .-_[]()")
     # Repeated separators left behind by removed tags should not leak into the title.
