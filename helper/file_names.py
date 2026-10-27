@@ -60,8 +60,14 @@ def extract_title(filename: str) -> str:
         stem = pattern.sub(" ", stem)
     stem = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem)
     stem = re.sub(r"(?i)\b(dual audio|multi audio|tamil audio|eng sub|japanese audio)\b", " ", stem)
+    # Remove release/source credits such as @Animes_Tamil_Hub or @channelname.
+    stem = re.sub(r"(?<![\w])@[A-Za-z0-9_]{2,}", " ", stem)
+    # Remove common trailing release-group / channel fragments after metadata removal.
+    stem = re.sub(r"(?i)\b(by|uploaded\s+by|source)\s*[:_-]?\s*$", " ", stem)
     stem = re.sub(r"[._]+", " ", stem)
     stem = _WHITESPACE.sub(" ", stem).strip(" .-_[]()")
+    # Repeated separators left behind by removed tags should not leak into the title.
+    stem = re.sub(r"\s*[-–—]+\s*$", "", stem).strip(" .-_[]()")
     return stem or Path(source_basename(filename)).stem or "file"
 
 

@@ -38,6 +38,15 @@ class FileNameTests(unittest.TestCase):
             "ANIFLIX - Naruto Shippuden S01 Ep02 [1080p] [TAMIL].mkv",
         )
 
+    def test_removes_trailing_source_credit_and_preserves_full_title(self):
+        self.assertEqual(
+            render_filename(
+                "Naruto Shippuden - S18E374 [Tamil] 480p @Animes_Tamil_Hub.mkv",
+                "@ANIFLIXANIMETAMIL - {title} S{season} Ep{episode} [{quality}] [TAMIL]",
+            ),
+            "@ANIFLIXANIMETAMIL - Naruto Shippuden S18 Ep374 [480p] [TAMIL].mkv",
+        )
+
     def test_legacy_template(self):
         self.assertEqual(
             render_filename("Anime EP12 480p.mp4", "Sseason Eepisode quality"),

@@ -39,7 +39,7 @@ class Database:
             "join_date": date.today().isoformat(),
             "file_id": None,
             "caption": None,
-            "metadata": "On",
+            "metadata": "Off",
             "metadata_code": "Telegram : @ANIFLIXANIMETAMIL",
             "format_template": None,
             "media_type": None,
@@ -136,7 +136,7 @@ class Database:
         return await self._get_value(user_id, "media_type")
 
     async def get_metadata(self, user_id: int):
-        return await self._get_value(user_id, "metadata", "On")
+        return await self._get_value(user_id, "metadata", "Off")
 
     async def set_metadata(self, user_id: int, metadata: str | bool) -> None:
         if isinstance(metadata, bool):

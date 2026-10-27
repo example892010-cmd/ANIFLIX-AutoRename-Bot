@@ -200,6 +200,8 @@ async def auto_rename_files(client, message):
     renaming_operations[file_id] = now
 
     status = None
+    started_at = time.perf_counter()
+    timings = {}
     try:
         new_filename = render_filename(original_name, format_template)
         extension = Path(original_name).suffix.lower()
@@ -213,19 +215,22 @@ async def auto_rename_files(client, message):
         # user-provided filenames from escaping the temporary work area.
         with tempfile.TemporaryDirectory(prefix="autorename_") as work_dir:
             source_path = os.path.join(work_dir, f"source{extension}")
+            stage_started = time.perf_counter()
             downloaded_path = await client.download_media(
                 message,
                 file_name=source_path,
                 progress=progress_for_pyrogram,
                 progress_args=("Downloading...", status, time.time()),
             )
+            timings["download"] = time.perf_counter() - stage_started
             if not downloaded_path or not os.path.isfile(downloaded_path):
                 raise RuntimeError("Telegram download did not produce a file")
 
             current_path = downloaded_path
+            stage_started = time.perf_counter()
             meta_state = await codeflixbots.get_metadata(user_id)
             if metadata_enabled(meta_state) and extension in METADATA_EXTENSIONS:
-                await _safe_edit(status, "🧩 Applying metadata...")
+                await _safe_edit(status, "🧩 Applying metadata (this may take extra time)...")
                 metadata_path = os.path.join(work_dir, f"metadata{extension}")
                 try:
                     await add_metadata(current_path, metadata_path, user_id)
@@ -237,6 +242,7 @@ async def auto_rename_files(client, message):
                     await _safe_edit(status, "⚠️ Metadata skipped; continuing with rename...")
             elif metadata_enabled(meta_state):
                 logger.info("Metadata skipped for unsupported file extension %s", extension)
+            timings["metadata"] = time.perf_counter() - stage_started
 
             output_path = os.path.join(work_dir, new_filename)
             if os.path.abspath(current_path) != os.path.abspath(output_path):
@@ -279,6 +285,7 @@ async def auto_rename_files(client, message):
             if thumbnail_path:
                 upload_params["thumb"] = thumbnail_path
 
+            stage_started = time.perf_counter()
             if upload_type == "video":
                 await client.send_video(
                     video=output_path,
@@ -289,7 +296,15 @@ async def auto_rename_files(client, message):
                 await client.send_audio(audio=output_path, **upload_params)
             else:
                 await client.send_document(document=output_path, **upload_params)
+            timings["upload"] = time.perf_counter() - stage_started
 
+        timings["total"] = time.perf_counter() - started_at
+        logger.info(
+            "Rename timings for user %s | size=%s bytes | download=%.2fs | metadata=%.2fs | thumbnail=%.2fs | upload=%.2fs | total=%.2fs | metadata_enabled=%s | filename=%s",
+            user_id, file_size, timings.get("download", 0.0), timings.get("metadata", 0.0),
+            timings.get("thumbnail", 0.0), timings.get("upload", 0.0), timings["total"],
+            metadata_enabled(meta_state), new_filename,
+        )
         await _safe_edit(status, "✅ Done! File renamed successfully.")
         logger.info("Renamed %s -> %s for user %s", original_name, new_filename, user_id)
 
