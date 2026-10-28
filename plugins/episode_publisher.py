@@ -26,11 +26,18 @@ from helper.file_names import (
     extract_title,
     normalize_anime_title,
 )
+from plugins.channel_routing import resolve_ongoing_targets as _resolve_ongoing_targets_from_settings
 from plugins.ongoing_posts import (
     _build_button_rows as _build_ongoing_button_rows,
     _send_bot_api as _send_ongoing_bot_api,
-    _targets_with_global_fallback as _resolve_ongoing_targets,
 )
+
+
+async def _resolve_ongoing_targets(route: dict) -> list[Any]:
+    """Resolve anime-specific ongoing targets, falling back to global settings."""
+    return await _resolve_ongoing_targets_from_settings(
+        route or {}, codeflixbots.codeflixbots
+    )
 
 logger = logging.getLogger(__name__)
 EXPECTED_QUALITIES = ("480p", "720p", "1080p")
