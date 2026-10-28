@@ -247,8 +247,9 @@ def _parse_batch_command(message_text: str) -> tuple[int, dict] | None:
     if not details:
         raise ValueError(
             "Send the batch command with anime details in this format:\n\n"
-            "/batch1 Anime Title\nSeason 1\n4\n\n"
-            "Use /batch2, /batch3, /batch4, or /batch5 for separate tasks."
+            "/batch1\nNaruto\nSeason 01\n04\n\n"
+            "The anime title must exactly match a completed Template Set to select its channel automatically."
+            " Use /batch2, /batch3, /batch4, or /batch5 for separate tasks."
         )
     if "-" in details["episode_range"]:
         raise ValueError("For a batch, send one episode number (for example, `4`), not an episode range.")
@@ -316,6 +317,54 @@ async def start_manual_batch(client: Client, message):
             "Finish or cancel that task before starting another batch, so uploaded files cannot go to the wrong anime."
         )
 
+    # A completed Template Set is selected automatically by the normalized anime title.
+    # Legacy routes without a completed set keep the original manual channel picker.
+    anime_key = normalize_anime_title(str(details.get("title") or ""))
+    template_set = await codeflixbots.codeflixbots["anime_templates"].find_one({"_id": anime_key}) if anime_key else None
+    if template_set and template_set.get("setup_complete"):
+        route_key = str(template_set.get("title_key") or anime_key)
+        route = await codeflixbots.codeflixbots["anime_routes"].find_one({"title_key": route_key})
+        if not route or not route.get("individual_channel"):
+            return await message.reply_text(
+                f"❌ Template Set {details['title']!r} is missing its Anime Post channel. "
+                "Open Admin Panel → Templates and create/finish that Template Set again."
+            )
+        invite_doc = await codeflixbots.codeflixbots["anime_invite_links"].find_one({"_id": anime_key}) or {}
+        if not invite_doc.get("links"):
+            return await message.reply_text(
+                f"❌ Template Set {details['title']!r} has no ongoing invite link. "
+                "Open Admin Panel → Anime Invite Links and save one before starting this batch."
+            )
+        if not template_set.get("poster_file_id"):
+            return await message.reply_text(
+                f"❌ Template Set {details['title']!r} has no ongoing poster. "
+                "Open Admin Panel → Templates and finish its poster step."
+            )
+        now = datetime.utcnow()
+        task = {
+            "_id": _batch_task_id(user.id, batch_number),
+            "user_id": int(user.id),
+            "batch_number": batch_number,
+            "details": details,
+            "route_choices": [route_key],
+            "selected_route_key": route_key,
+            "template_set_key": anime_key,
+            "files": [],
+            "status": "waiting_files",
+            "created_at": now,
+            "updated_at": now,
+        }
+        await _batch_tasks_collection().replace_one({"_id": task["_id"]}, task, upsert=True)
+        await message.reply_text(
+            f"📦 Batch{batch_number} — Template Set detected\n"
+            f"🎬 Anime: {details['title']}\nSeason: {details['season']} • Episode: {details['episode_range']}\n"
+            f"📺 Anime channel: {route.get('individual_channel_title') or route.get('individual_channel')}\n"
+            "🔗 Ongoing invite: Saved • 🖼 Ongoing poster: Saved\n\n"
+            "📥 Send exactly 3 files (480p, 720p, and 1080p).\n"
+            "The anime post uses your saved Anime Post text template; the saved poster and invite button are used only for ongoing-channel posts."
+        )
+        return
+
     routes_cursor = codeflixbots.codeflixbots["anime_routes"].find(
         {"individual_channel": {"$exists": True, "$nin": [None, ""]}}
     ).sort("title", 1).limit(50)
@@ -337,6 +386,7 @@ async def start_manual_batch(client: Client, message):
         "details": details,
         "route_choices": route_choices,
         "selected_route_key": None,
+        "template_set_key": None,
         "files": [],
         "status": "choosing_channel",
         "created_at": now,
@@ -346,7 +396,7 @@ async def start_manual_batch(client: Client, message):
     await message.reply_text(
         f"📦 **Batch{batch_number}**\n"
         f"Anime: {details['title']}\nSeason: {details['season']}\nEpisode: {details['episode_range']}\n\n"
-        "Select the saved anime channel for this post:",
+        "No completed Template Set matched this title, so select the saved anime channel for this post:",
         reply_markup=keyboard,
     )
 
