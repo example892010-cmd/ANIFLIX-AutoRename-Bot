@@ -235,7 +235,7 @@ def _menu_keyboard(menu: str):
         ]
     elif menu == "templates":
         rows = [
-            [InlineKeyboardButton("➕ Create Template", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Template", callback_data="adm:template_edit")],
+            [InlineKeyboardButton("➕ Create Template Set", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Set Poster", callback_data="adm:template_edit")],
             [InlineKeyboardButton("📋 View Templates", callback_data="adm:template_list")],
             [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
             [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
@@ -507,11 +507,18 @@ async def _global_post_templates():
 
 async def _saved_templates_text():
     cursor = codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find({}).sort("title", 1).limit(100)
-    lines = ["📚 Saved Anime Templates"]
+    lines = ["🧩 Saved Template Sets"]
     async for item in cursor:
-        lines.append(f"• {item.get('title', '(unnamed)')} — {'Poster saved' if item.get('poster_file_id') else 'No poster'}")
-    return "\n".join(lines) if len(lines) > 1 else "No templates saved yet. Tap Create Template to add one."
-
+        title = item.get("title", "(unnamed)")
+        key = item.get("title_key") or _title_key(title)
+        route = await _route_collection().find_one({"title_key": key}) or {}
+        invite = await codeflixbots.codeflixbots[INVITES_COLLECTION].find_one({"_id": key}) or {}
+        links_count = len(invite.get("links") or [])
+        channel_status = "Anime channel saved" if route.get("individual_channel") else "Anime channel missing"
+        poster_status = "Ongoing poster saved" if item.get("poster_file_id") else "Ongoing poster missing"
+        set_status = "Ready for /batchN" if item.get("setup_complete") and links_count else "Setup incomplete / legacy poster-only"
+        lines.append(f"• {title}\n  {channel_status} • {links_count} invite link(s) • {poster_status}\n  {set_status}")
+    return "\n\n".join(lines) if len(lines) > 1 else "No template sets saved yet. Tap Create Template Set to add one."
 
 async def _ongoing_buttons_summary():
     settings = await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].find_one({"_id": "global"}) or {}
@@ -644,10 +651,97 @@ async def handle_admin_session_input(client: Client, message: Message):
         elif stage == "template_create_name":
             title = (message.text or "").strip()
             if not title:
-                raise ValueError("Send a non-empty template name, e.g. Naruto Shippuden.")
+                raise ValueError("Send a non-empty template-set name, e.g. Naruto.")
             key = _title_key(title)
-            await _set_admin_state(user.id, "template_create_poster", {"title": title, "title_key": key})
-            await message.reply_text(f"Send me the poster of the template: {title}. Send it as a photo.")
+            await _set_admin_state(user.id, "template_create_channel_forward", {"title": title, "title_key": key})
+            await message.reply_text(
+                f"🧩 Creating Template Set: {title}\n\n"
+                "Step 1/3 — Anime channel setup.\n"
+                "Make sure the bot is already an admin with permission to post, then forward an original message from that anime channel here.\n\n"
+                "Do not copy/paste the message. Send /cancel to stop."
+            )
+
+        elif stage == "template_create_channel_forward":
+            title, key = (data.get("title") or "").strip(), (data.get("title_key") or "").strip()
+            source_chat = _forwarded_channel_from_message(message)
+            source_type = getattr(source_chat, "type", None) if source_chat is not None else None
+            source_type = str(getattr(source_type, "value", source_type)).casefold().split(".")[-1]
+            if source_chat is None or source_type != "channel":
+                raise ValueError("Forward an original message directly from the anime channel. Do not copy/paste it.")
+            chat_id = int(source_chat.id)
+            await _validate_post_rights(client, chat_id)
+            channel_title = getattr(source_chat, "title", None) or title
+            await _route_collection().update_one(
+                {"title_key": key},
+                {"$set": {
+                    "title": title, "title_key": key,
+                    "individual_channel": chat_id,
+                    "individual_channel_title": channel_title,
+                    "updated_at": _now_utc(),
+                }, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            data["channel_id"] = chat_id
+            data["channel_title"] = channel_title
+            await _set_admin_state(user.id, "template_create_invite_link", data)
+            await message.reply_text(
+                f"✅ Anime channel saved: {channel_title}\nChannel ID: {chat_id}\n\n"
+                "Step 2/3 — Send the invite link used for the ongoing-post inline button.\n"
+                "Use this format (one or more lines):\n"
+                "DOWNLOAD NOW | https://t.me/+your-invite-link"
+            )
+
+        elif stage == "template_create_invite_link":
+            title = (data.get("title") or "").strip()
+            raw_text = (message.text or message.caption or "").strip()
+            rows, errors = [], []
+            for line_number, line in enumerate(raw_text.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    parsed = _parse_invite_line(line)
+                    if not parsed:
+                        errors.append(f"Line {line_number}: use Button Name | https://t.me/+invite-link")
+                    else:
+                        rows.append(parsed)
+                except ValueError as exc:
+                    errors.append(f"Line {line_number}: {exc}")
+            if errors:
+                raise ValueError("\n".join(errors))
+            if not rows:
+                raise ValueError("Send at least one invite-link line, for example: DOWNLOAD NOW | https://t.me/+invite-link")
+            added, updated = await _upsert_invite_links(title, rows)
+            await _set_admin_state(user.id, "template_create_set_poster", data)
+            await message.reply_text(
+                f"✅ Ongoing invite link(s) saved for {title}. Added: {added}; updated: {updated}.\n\n"
+                "Step 3/3 — Send the poster photo for ongoing-channel posts.\n"
+                "This poster is only for ongoing posts. Anime-channel posts continue using the saved Anime Post text template and the automatic quality buttons."
+            )
+
+        elif stage == "template_create_set_poster":
+            title, key = (data.get("title") or "").strip(), (data.get("title_key") or "").strip()
+            if not message.photo:
+                raise ValueError("Please send the ongoing poster as a Telegram photo.")
+            poster_id = _message_photo_file_id(message)
+            if not poster_id:
+                raise ValueError("Telegram did not provide a poster file ID. Please send the photo again.")
+            await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one(
+                {"_id": key},
+                {"$set": {
+                    "title": title, "title_key": key, "poster_file_id": poster_id,
+                    "setup_complete": True, "setup_version": 1, "updated_at": _now_utc(),
+                }, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text(
+                f"✅ Template Set saved: {title}\n"
+                f"📺 Anime channel: {data.get('channel_title') or data.get('channel_id')}\n"
+                "🔗 Ongoing invite link: Saved\n🖼 Ongoing poster: Saved\n\n"
+                f"Start a batch with these 4 lines:\n/batch1\n{title}\nSeason 01\n04\n\n"
+                "The set is detected by anime title. Anime-channel posts use the saved Anime Post text template; the poster and invite link are used for ongoing posts.",
+                reply_markup=_admin_main_keyboard(),
+            )
 
         elif stage == "template_create_poster":
             title, key = data.get("title", ""), data.get("title_key", "")
@@ -1214,7 +1308,7 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
         except Exception:
             await client.send_message(user.id, message_text, reply_markup=_menu_keyboard("invites"))
     elif action in {"template_create"}:
-        await _prompt(client, user.id, "template_create_name", "Send the template name exactly as the anime name, e.g. Naruto Shippuden.")
+        await _prompt(client, user.id, "template_create_name", "Send the Template Set title exactly as you will type it in the /batch details, e.g. Naruto.")
     elif action in {"template_edit"}:
         await _prompt(client, user.id, "template_edit_name", "Send the exact name of the saved template you want to edit.")
     elif action == "template_list":
