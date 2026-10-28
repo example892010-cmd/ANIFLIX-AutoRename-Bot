@@ -34,6 +34,34 @@ from plugins.episode_publisher import store_file_and_process
 
 logger = logging.getLogger(__name__)
 
+_PROGRESS_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🔄 Refresh Progress", callback_data="refresh_file_progress")]]
+)
+
+
+@Client.on_callback_query(filters.regex(r"^refresh_file_progress$"))
+async def refresh_file_progress(client: Client, query: CallbackQuery):
+    """Refresh the visible download/upload progress message on demand."""
+    try:
+        if query.message:
+            current_text = query.message.text or query.message.caption or "⏳ Progress is updating..."
+            await query.message.edit_text(
+                current_text,
+                reply_markup=_PROGRESS_KEYBOARD,
+                disable_web_page_preview=True,
+            )
+        await query.answer("Progress refreshed")
+    except Exception as exc:
+        # Telegram raises MESSAGE_NOT_MODIFIED if the visible text is already current.
+        if "MESSAGE_NOT_MODIFIED" in str(exc).upper() or "message is not modified" in str(exc).lower():
+            await query.answer("Progress is already up to date")
+        else:
+            logger.debug("Could not refresh progress message: %s", exc)
+            try:
+                await query.answer("Progress is updating automatically", show_alert=False)
+            except Exception:
+                pass
+
 # Prevent accidentally handling the same Telegram file twice in a short interval.
 renaming_operations: dict[str, datetime] = {}
 
@@ -54,6 +82,51 @@ SEND_AUDIO_EXTENSIONS = {".mp3", ".m4a"}
 def extract_quality_compat(filename):
     """Compatibility wrapper kept for any local extensions importing this helper."""
     return extract_quality(filename)
+
+
+async def _detect_video_quality(path: str, media=None) -> str | None:
+    """Detect quality from the actual video dimensions, not just its filename."""
+    width = height = 0
+
+    # Telegram provides dimensions for normal video messages, but not always for
+    # videos uploaded as documents, so probe the downloaded original file too.
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=12)
+        if probe.returncode == 0:
+            match = re.search(rb"(\d+)x(\d+)", stdout)
+            if match:
+                width, height = int(match.group(1)), int(match.group(2))
+    except (FileNotFoundError, asyncio.TimeoutError, OSError):
+        pass
+
+    if not height:
+        try:
+            width = int(getattr(media, "width", 0) or 0)
+            height = int(getattr(media, "height", 0) or 0)
+        except (TypeError, ValueError):
+            width = height = 0
+
+    if height <= 0:
+        return None
+    # Standard release labels follow the video's vertical resolution.
+    if height >= 2000:
+        return "2160p"
+    if height >= 1300:
+        return "1440p"
+    if height >= 1000:
+        return "1080p"
+    if height >= 650:
+        return "720p"
+    if height >= 430:
+        return "480p"
+    if height >= 300:
+        return "360p"
+    return f"{height}p"
 
 
 
@@ -88,12 +161,12 @@ def _parse_upload_details(text: str) -> dict | None:
     return {"title": title, "season": str(int(season)), "episode_range": episode_range}
 
 
-def _render_filename_for_details(original_filename: str, template: str, details: dict) -> str:
+def _render_filename_for_details(original_filename: str, template: str, details: dict, quality_override: str | None = None) -> str:
     """Render a filename using the user's supplied anime/season/episode details."""
     original = source_basename(original_filename)
     extension = Path(original).suffix
-    quality = extract_quality(original)
-    # Some uploaded files omit quality in their filename; retain the existing behaviour.
+    quality = quality_override or extract_quality(original)
+    # Prefer verified source-video resolution when available; otherwise retain filename detection.
     values = {
         "title": str(details["title"]).strip(),
         "season": str(details["season"]).strip(),
@@ -701,7 +774,7 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             extension = ""
         file_size = int(getattr(media, "file_size", 0) or 0)
         duration = getattr(media, "duration", None)
-        status = await message.reply_text("⏬ Downloading file...")
+        status = await message.reply_text("⏬ Downloading file...", reply_markup=_PROGRESS_KEYBOARD)
 
         # Unique temp directory prevents collisions across concurrent uploads and keeps
         # user-provided filenames from escaping the temporary work area.
@@ -717,6 +790,19 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             timings["download"] = time.perf_counter() - stage_started
             if not downloaded_path or not os.path.isfile(downloaded_path):
                 raise RuntimeError("Telegram download did not produce a file")
+
+            # Inspect the original uploaded file before choosing the final filename.
+            # This fixes files named without a quality marker being renamed [Unknown].
+            detected_quality = None
+            # If the source filename already contains a recognized quality, preserve it and
+            # skip ffprobe. This avoids a subprocess delay for most uploads without changing
+            # their names. Probe only when quality is absent/unknown.
+            source_quality = extract_quality(original_name)
+            if (extension in VIDEO_EXTENSIONS or media_type == "video") and source_quality.strip().casefold() == "unknown":
+                detected_quality = await _detect_video_quality(downloaded_path, media)
+            new_filename = _render_filename_for_details(
+                original_name, format_template, _details, quality_override=detected_quality
+            )
 
             current_path = downloaded_path
             stage_started = time.perf_counter()
@@ -767,6 +853,10 @@ async def auto_rename_files(client, message, _details: dict | None = None):
                 upload_type = "document"
 
             await _safe_edit(status, "⏫ Uploading renamed file...")
+            try:
+                await status.edit_reply_markup(_PROGRESS_KEYBOARD)
+            except Exception:
+                pass
             upload_params = {
                 "chat_id": message.chat.id,
                 "caption": caption,

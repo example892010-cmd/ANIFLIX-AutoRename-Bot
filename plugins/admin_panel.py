@@ -7,16 +7,6 @@ import os, sys, time, asyncio, logging, datetime
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
-
-def _message_photo_file_id(message):
-    """Get a photo file_id from a Pyrogram Message across supported photo shapes."""
-    photo = getattr(message, "photo", None)
-    if not photo:
-        return None
-    # Pyrogram normally exposes a single Photo object; tolerate sequences too.
-    if isinstance(photo, (list, tuple)):
-        photo = photo[-1] if photo else None
-    return getattr(photo, "file_id", None) if photo else None
 logger.setLevel(logging.INFO)
 ADMIN_USER_ID = Config.ADMIN
 
@@ -140,6 +130,10 @@ POST_TEMPLATES_COLLECTION = "post_template_settings"
 FSUB_COLLECTION = "fsub_settings"
 MAX_ONGOING_CHANNELS = 6
 MAX_FSUB_CHANNELS = 6
+DEFAULT_ONGOING_BUTTONS_TEMPLATE = (
+    "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
+    "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1"
+)
 DEFAULT_ONGOING_CHANNEL_IDS = [
     -1003693662050,
     -1003528863118,
@@ -152,6 +146,16 @@ DEFAULT_ONGOING_CHANNEL_IDS = [
 
 def _now_utc():
     return datetime.now(timezone.utc)
+
+
+def _message_photo_file_id(message):
+    """Return the largest Telegram photo file_id safely across Pyrogram photo shapes."""
+    photo = getattr(message, "photo", None)
+    if not photo:
+        return None
+    if isinstance(photo, (list, tuple)):
+        photo = photo[-1] if photo else None
+    return getattr(photo, "file_id", None) if photo else None
 
 
 def _formatted_message_content(message: Message) -> str:
@@ -177,6 +181,7 @@ def _admin_main_keyboard():
         [InlineKeyboardButton("📺 Anime Channels", callback_data="adm:anime_channels"), InlineKeyboardButton("🔗 Anime Invite Links", callback_data="adm:invites")],
         [InlineKeyboardButton("🎬 Episode Manager", callback_data="adm:episode_manager"), InlineKeyboardButton("✅ Link Verification", callback_data="adm:verify_links")],
         [InlineKeyboardButton("📚 Templates", callback_data="adm:templates"), InlineKeyboardButton("📝 Post Text", callback_data="adm:post_customization")],
+        [InlineKeyboardButton("🔘 Ongoing Buttons", callback_data="adm:ongoing_buttons")],
         [InlineKeyboardButton("📡 Ongoing Channels", callback_data="adm:ongoing_channels"), InlineKeyboardButton("🔒 Force Subscribe", callback_data="adm:fsub")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings")],
         [InlineKeyboardButton("🚀 Publish Ongoing", callback_data="adm:publish_ongoing")],
@@ -220,6 +225,11 @@ def _menu_keyboard(menu: str):
         rows = [
             [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
             [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
+        ]
+    elif menu == "ongoing_buttons":
+        rows = [
+            [InlineKeyboardButton("✏️ Edit / Add Buttons", callback_data="adm:ongoing_buttons_edit")],
+            [InlineKeyboardButton("🔄 Refresh Template", callback_data="adm:ongoing_buttons_refresh")],
         ]
     elif menu == "templates":
         rows = [
@@ -486,6 +496,18 @@ async def _saved_templates_text():
     return "\n".join(lines) if len(lines) > 1 else "No templates saved yet. Tap Create Template to add one."
 
 
+async def _ongoing_buttons_summary():
+    settings = await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].find_one({"_id": "global"}) or {}
+    template = settings.get("ongoing_buttons_template") or DEFAULT_ONGOING_BUTTONS_TEMPLATE
+    return (
+        "🔘 ONGOING POST BUTTONS\n\n"
+        "Current template (shared by all ongoing channels):\n"
+        f"{template}\n\n"
+        "Color codes: #b = blue, #r = red, #g = green. One button per line, format: "
+        "#b Button Name - URL. Use {anime_invite} for the selected anime's saved invite link."
+    )
+
+
 @Client.on_message(filters.private & filters.command("admin"))
 async def admin_dashboard(client: Client, message: Message):
     if not is_admin_user(getattr(message, "from_user", None)):
@@ -603,6 +625,24 @@ async def handle_admin_session_input(client: Client, message: Message):
             else:
                 raise ValueError("Send a poster photo or type KEEP.")
 
+        elif stage == "ongoing_buttons_template":
+            template = (message.text or message.caption or "").strip()
+            if not template:
+                raise ValueError("Send at least one button line, or use /cancel to leave without saving.")
+            if len(template) > 6000:
+                raise ValueError("Keep the button template under 6000 characters.")
+            lines = [line.strip() for line in template.splitlines() if line.strip()]
+            invalid = [line for line in lines if not re.match(r"^#[bgr]\s+.+?\s+-\s*.+$", line, re.IGNORECASE)]
+            if invalid:
+                raise ValueError("Invalid line format. Use one button per line, e.g. #b DOWNLOAD NOW - {anime_invite}. Color codes: #b, #r, #g.")
+            await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].update_one(
+                {"_id": "global"},
+                {"$set": {"ongoing_buttons_template": "\n".join(lines), "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text("✅ Ongoing buttons template saved. It will be used for every ongoing-channel post. The Download Now button automatically uses that anime's saved invite link.", reply_markup=_admin_main_keyboard())
+
         elif stage in {"main_ongoing_text", "anime_post_text"}:
             template = _formatted_message_content(message)
             if not template:
@@ -661,7 +701,7 @@ async def handle_admin_session_input(client: Client, message: Message):
         elif stage == "ongoing_template_content":
             title = data["title"]
             template = _formatted_message_content(message)
-            photo_id = _message_photo_file_id(message)
+            photo_id = _message_photo_file_id(message) if message.photo else None
             if photo_id and not template:
                 data["poster_file_id"] = photo_id
                 await _set_admin_state(user.id, "ongoing_template_text_after_photo", data)
@@ -979,7 +1019,7 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             await query.message.edit_text("🍥 **ANIFLIX AUTO-RENAME BOT — ADMIN PANEL**\n\nChoose a section below.", reply_markup=_admin_main_keyboard())
         except Exception:
             await query.message.reply_text("ANIFLIX Auto-Rename Bot — Admin Panel", reply_markup=_admin_main_keyboard())
-    elif action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "templates"}:
+    elif action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "ongoing_buttons", "templates"}:
         titles = {
             "anime_channels": "📺 ANIME CHANNELS — Add, edit, remove, or view each anime's individual and ongoing destinations.",
             "invites": "🔗 ANIME INVITE LINKS — Manage the buttons used in manual ongoing posts.",
@@ -988,9 +1028,10 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             "episode_manager": "🎬 EPISODE MANAGER — Inspect saved groups and repair legacy split groups.",
             "settings": "⚙️ BOT SETTINGS — Force Subscribe and channel configuration.",
             "post_customization": "📝 POST TEXT — Configure the shared Main Ongoing Post Text and shared Anime Post Text.",
+            "ongoing_buttons": await _ongoing_buttons_summary(),
             "templates": await _saved_templates_text(),
         }
-        keyboard_key = action if action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "templates"} else "settings"
+        keyboard_key = action if action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "ongoing_buttons", "templates"} else "settings"
         try:
             await query.message.edit_text(titles[action], reply_markup=_menu_keyboard(keyboard_key), disable_web_page_preview=True)
         except Exception:
@@ -1017,6 +1058,20 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
         await _prompt(client, user.id, "template_edit_name", "Send the exact name of the saved template you want to edit.")
     elif action == "template_list":
         await client.send_message(user.id, await _saved_templates_text(), reply_markup=_menu_keyboard("templates"))
+    elif action == "ongoing_buttons_refresh":
+        text = await _ongoing_buttons_summary()
+        try:
+            await query.message.edit_text(text, reply_markup=_menu_keyboard("ongoing_buttons"), disable_web_page_preview=True)
+        except Exception:
+            await client.send_message(user.id, text, reply_markup=_menu_keyboard("ongoing_buttons"), disable_web_page_preview=True)
+    elif action == "ongoing_buttons_edit":
+        await _prompt(
+            client, user.id, "ongoing_buttons_template",
+            "Send the complete ongoing-button template, one button per line.\n\n"
+            "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
+            "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1\n\n"
+            "Use #b for blue, #r for red, #g for green. {anime_invite} is replaced with the invite link saved for whichever anime is being posted. This template is shared by all ongoing channels."
+        )
     elif action == "main_ongoing_text":
         await _prompt(client, user.id, "main_ongoing_text", "Send the shared Main Ongoing Post Text. This text is used for every anime; placeholders such as {title}, {season}, {episode_range}, {status}, and {qualities} are replaced automatically.")
     elif action in {"anime_post_text", "anime_post"}:
