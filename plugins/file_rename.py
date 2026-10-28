@@ -31,7 +31,13 @@ from helper.file_names import (
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
 from plugins.episode_publisher import _batch_id, store_file_and_process
-from plugins.ongoing_posts import _targets_with_global_fallback as _resolve_ongoing_targets
+from plugins.channel_routing import resolve_ongoing_targets as _resolve_ongoing_targets_from_settings
+
+async def _resolve_ongoing_targets(route: dict) -> list:
+    """Resolve anime-specific ongoing targets with global-channel fallback."""
+    return await _resolve_ongoing_targets_from_settings(
+        route or {}, codeflixbots.codeflixbots
+    )
 
 logger = logging.getLogger(__name__)
 
