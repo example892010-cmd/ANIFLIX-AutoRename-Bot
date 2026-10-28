@@ -64,3 +64,9 @@ The bot uses MongoDB for user settings. Create a MongoDB database and allow your
 ## License and upstream credit
 
 This project preserves the upstream MIT license in `LICENSE`. See the license and original source attribution before redistributing modifications.
+
+## Ongoing post button templates
+
+Open `/admin` → **Ongoing Buttons** to edit the shared button template used by ongoing-channel posts. Add one button per line using `#b Button Name - URL`, where `#b` is blue, `#r` is red, and `#g` is green. Use `{anime_invite}` for a saved invite URL; a button named **DOWNLOAD NOW** also automatically uses the current anime's saved invite link. The **Refresh Template** control reloads the currently saved template.
+
+The file progress status also includes **Refresh Progress** for both download and upload stages. The rename handler skips video probing when a recognized quality is already in the filename and probes only when quality is unknown.
