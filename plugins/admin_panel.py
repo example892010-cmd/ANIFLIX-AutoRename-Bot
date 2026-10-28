@@ -7,6 +7,16 @@ import os, sys, time, asyncio, logging, datetime
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
+
+def _message_photo_file_id(message):
+    """Get a photo file_id from a Pyrogram Message across supported photo shapes."""
+    photo = getattr(message, "photo", None)
+    if not photo:
+        return None
+    # Pyrogram normally exposes a single Photo object; tolerate sequences too.
+    if isinstance(photo, (list, tuple)):
+        photo = photo[-1] if photo else None
+    return getattr(photo, "file_id", None) if photo else None
 logger.setLevel(logging.INFO)
 ADMIN_USER_ID = Config.ADMIN
 
@@ -555,7 +565,7 @@ async def handle_admin_session_input(client: Client, message: Message):
             title, key = data.get("title", ""), data.get("title_key", "")
             if not message.photo:
                 raise ValueError("Please send the template poster as a Telegram photo.")
-            poster_id = message.photo[-1].file_id
+            poster_id = _message_photo_file_id(message)
             await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one(
                 {"_id": key},
                 {"$set": {"title": title, "title_key": key, "poster_file_id": poster_id, "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
@@ -585,7 +595,7 @@ async def handle_admin_session_input(client: Client, message: Message):
                 await _clear_admin_state(user.id)
                 await message.reply_text(f"✅ Kept the saved poster for {title}.", reply_markup=_admin_main_keyboard())
             elif message.photo:
-                poster_id = message.photo[-1].file_id
+                poster_id = _message_photo_file_id(message)
                 await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one({"_id": key}, {"$set": {"poster_file_id": poster_id, "updated_at": _now_utc()}})
                 await _route_collection().update_one({"title_key": key}, {"$set": {"poster_file_id": poster_id, "updated_at": _now_utc()}}, upsert=True)
                 await _clear_admin_state(user.id)
@@ -651,7 +661,7 @@ async def handle_admin_session_input(client: Client, message: Message):
         elif stage == "ongoing_template_content":
             title = data["title"]
             template = _formatted_message_content(message)
-            photo_id = message.photo[-1].file_id if message.photo else None
+            photo_id = _message_photo_file_id(message)
             if photo_id and not template:
                 data["poster_file_id"] = photo_id
                 await _set_admin_state(user.id, "ongoing_template_text_after_photo", data)

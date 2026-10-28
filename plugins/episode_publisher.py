@@ -235,9 +235,9 @@ async def _verify_batch_files(client, batch: dict) -> tuple[bool, str]:
     return True, ""
 
 
-async def _send_target(client, route: dict, batch: dict, mode: str) -> tuple[bool, str]:
+async def _send_target(client, route: dict, batch: dict, mode: str, target_override=None) -> tuple[bool, str]:
     target_field = "individual_channel" if mode == "individual" else "ongoing_channel"
-    target = route.get(target_field)
+    target = target_override if target_override is not None else route.get(target_field)
     if not target:
         return False, "not configured"
 
@@ -382,46 +382,70 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
         )
         return (
             "✅ All 3 files are stored and verified. Links are ready, but no channel mapping is configured for this anime yet.\n"
-            "Use /setanimechannels to publish.\n\n" + _link_summary(files)
-        )
-
-    # Individual episode posts are automatic. Ongoing posts are intentionally separate:
-    # admins trigger them with /ongoing after saving the anime's invite links and template.
-    target = route.get("individual_channel")
-    if not target:
-        await codeflixbots.codeflixbots["episode_batches"].update_one(
-            {"_id": batch["_id"]},
-            {"$set": {"state": "ready_waiting_for_channel", "updated_at": _now()}},
-        )
-        return (
-            "✅ All 3 files are stored and verified. Links are ready, but this anime has no individual Anime Post channel.\n"
-            "Set one in Admin Panel → Anime Channels. Ongoing posts are manual via /ongoing Anime Title.\n\n"
+            "Choose a saved anime channel in the batch workflow, or configure it in Admin Panel → Anime Channels.\n\n"
             + _link_summary(files)
         )
 
+    individual_target = route.get("individual_channel")
+    ongoing_targets = route.get("ongoing_channels") or ([route.get("ongoing_channel")] if route.get("ongoing_channel") else [])
+    # Preserve order and avoid sending twice if the same channel was assigned in both fields.
+    unique_ongoing = []
+    seen_ongoing = set()
+    for candidate in ongoing_targets:
+        if candidate is None or str(candidate).strip() == "":
+            continue
+        identity = str(candidate).casefold()
+        if identity not in seen_ongoing:
+            seen_ongoing.add(identity)
+            unique_ongoing.append(candidate)
+
     failures = []
-    try:
-        await _send_target(client, route, batch, "individual")
-    except Exception as exc:
-        logger.exception("Could not publish individual post for batch %s", batch["_id"])
-        failures.append(f"individual: {type(exc).__name__}: {exc}")
+    if individual_target:
+        try:
+            await _send_target(client, route, batch, "individual", target_override=individual_target)
+        except Exception as exc:
+            logger.exception("Could not publish individual post for batch %s", batch["_id"])
+            failures.append(f"Anime channel {individual_target}: {type(exc).__name__}: {exc}")
+    else:
+        failures.append("No individual Anime Post channel is configured for the selected route")
+
+    # Ongoing posts are now automatic too; no /ongoing command is required.
+    for ongoing_target in unique_ongoing:
+        try:
+            await _send_target(client, route, batch, "ongoing", target_override=ongoing_target)
+        except Exception as exc:
+            logger.exception("Could not publish ongoing post to %s for batch %s", ongoing_target, batch["_id"])
+            failures.append(f"Ongoing {ongoing_target}: {type(exc).__name__}: {exc}")
 
     refreshed = await codeflixbots.codeflixbots["episode_batches"].find_one({"_id": batch["_id"]}) or batch
     published_targets = refreshed.get("published_targets") or {}
-    all_done = bool(published_targets.get(f"individual:{target}"))
+    expected_target_keys = []
+    if individual_target:
+        expected_target_keys.append(f"individual:{individual_target}")
+    expected_target_keys.extend(f"ongoing:{target}" for target in unique_ongoing)
+    all_done = bool(expected_target_keys) and all(published_targets.get(key) for key in expected_target_keys)
     state = "published" if all_done and not failures else "publish_partial"
     await codeflixbots.codeflixbots["episode_batches"].update_one(
         {"_id": batch["_id"]},
         {"$set": {"state": state, "last_error": "\n".join(failures) if failures else None, "updated_at": _now()}},
     )
     if failures:
-        return "⚠️ 3 files are stored and verified, but the Anime Post channel publish failed. Check bot admin permissions and logs."
-    return "✅ All 3 qualities stored and verified. Anime Post published with inline quality buttons. Use /ongoing Anime Title when you want an ongoing update."
+        return (
+            "⚠️ Files are stored and links are generated, but one or more posts were not confirmed.\n"
+            + "\n".join(failures[:4])
+        )
+    ongoing_summary = f" Ongoing published to {len(unique_ongoing)} channel(s)." if unique_ongoing else " No ongoing destinations are configured for this anime."
+    return "✅ All 3 files stored and verified. Anime Post published with inline quality buttons." + ongoing_summary
 
 
 async def _find_route_for_batch(batch: dict):
-    """Find an exact route first, then a single high-confidence title variant."""
+    """Use the route explicitly selected for a manual batch, then title matching."""
     routes = codeflixbots.codeflixbots["anime_routes"]
+    selected_key = batch.get("route_title_key")
+    if selected_key:
+        selected = await routes.find_one({"title_key": selected_key})
+        if selected:
+            return selected
     exact = await routes.find_one({"title_key": batch.get("title_key")})
     if exact:
         return exact
@@ -553,9 +577,13 @@ async def publish_ready_batch(client, batch: dict) -> str:
         if current.get("state") == "published":
             current_route = await _find_route_for_batch(current) or {}
             published_targets = current.get("published_targets") or {}
-            target = current_route.get("individual_channel")
-            if not target or published_targets.get(f"individual:{target}"):
-                return "✅ This episode has already been published; duplicate post prevented."
+            expected = []
+            if current_route.get("individual_channel"):
+                expected.append(f"individual:{current_route['individual_channel']}")
+            ongoing = current_route.get("ongoing_channels") or ([current_route.get("ongoing_channel")] if current_route.get("ongoing_channel") else [])
+            expected.extend(f"ongoing:{target}" for target in ongoing if target)
+            if expected and all(published_targets.get(key) for key in expected):
+                return "✅ This episode has already been published to all configured channels; duplicate post prevented."
         current_files = current.get("files") or {}
         if not all(current_files.get(_quality_field(q)) for q in EXPECTED_QUALITIES):
             return "⏳ Waiting until 480p, 720p, and 1080p are all stored."
@@ -714,6 +742,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
                 "state": "collecting",
                 "updated_at": created_at,
                 "last_error": None,
+                **({"route_title_key": details.get("route_title_key")} if details and details.get("route_title_key") else {}),
             },
         },
         upsert=True,

@@ -14,8 +14,10 @@ from pathlib import Path
 from PIL import Image
 from pyrogram import Client, enums, filters, StopPropagation
 from pyrogram.errors import FloodWait
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from helper.database import codeflixbots
+from config import Config
 from helper.file_names import (
     extract_quality,
     extract_season_episode,
@@ -24,6 +26,7 @@ from helper.file_names import (
     render_filename,
     source_basename,
     sanitize_filename,
+    normalize_anime_title,
 )
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
@@ -115,6 +118,309 @@ def _render_filename_for_details(original_filename: str, template: str, details:
     return sanitize_filename(text)
 
 
+# Manual batch workflow: /batch1 through /batch5 starts a separate task.
+# The task metadata and source message IDs are stored in MongoDB so the collecting
+# state survives a routine worker restart; processing remains sequential per task.
+BATCH_TASKS_COLLECTION = "manual_batch_tasks"
+_BATCH_TASK_LOCKS = defaultdict(asyncio.Lock)
+_BATCH_WORKING_USERS: set[int] = set()
+_BATCH_FILE_LIMIT = 3
+
+
+def _batch_task_id(user_id: int, batch_number: int) -> str:
+    return f"{int(user_id)}:batch{int(batch_number)}"
+
+
+def _is_batch_admin(user) -> bool:
+    """Check configured owner/admin IDs without depending on optional UI modules."""
+    try:
+        user_id = int(getattr(user, "id", user))
+    except (TypeError, ValueError):
+        return False
+    allowed = {int(value) for value in (getattr(Config, "ADMIN", []) or [])}
+    for name in ("OWNER_ID", "OWNERID", "ADMIN_ID", "ADMIN"):
+        raw = os.environ.get(name, "").strip()
+        for item in raw.replace(",", " ").split() if raw else []:
+            try:
+                allowed.add(int(item))
+            except ValueError:
+                continue
+    return user_id in allowed
+
+
+def _batch_tasks_collection():
+    return codeflixbots.codeflixbots[BATCH_TASKS_COLLECTION]
+
+
+def _parse_batch_command(message_text: str) -> tuple[int, dict] | None:
+    """Parse /batchN Anime Title + Season + Episode from the same message."""
+    raw_lines = (message_text or "").splitlines()
+    if not raw_lines:
+        return None
+    command_match = re.match(r"^\s*/batch([1-5])(?:@\w+)?(?:\s+(.*))?\s*$", raw_lines[0], re.I)
+    if not command_match:
+        return None
+    batch_number = int(command_match.group(1))
+    title_on_command = (command_match.group(2) or "").strip()
+    detail_lines = ([title_on_command] if title_on_command else []) + [line.strip() for line in raw_lines[1:] if line.strip()]
+    details = _parse_upload_details("\n".join(detail_lines))
+    if not details:
+        raise ValueError(
+            "Send the batch command with anime details in this format:\n\n"
+            "/batch1 Anime Title\nSeason 1\n4\n\n"
+            "Use /batch2, /batch3, /batch4, or /batch5 for separate tasks."
+        )
+    if "-" in details["episode_range"]:
+        raise ValueError("For a batch, send one episode number (for example, `4`), not an episode range.")
+    return batch_number, details
+
+
+async def _active_batch_task(user_id: int) -> dict | None:
+    cursor = _batch_tasks_collection().find({
+        "user_id": int(user_id),
+        "status": {"$in": ["choosing_channel", "waiting_files", "processing"]},
+    }).sort("updated_at", -1).limit(1)
+    rows = await cursor.to_list(length=1)
+    return rows[0] if rows else None
+
+
+async def _batch_routes_keyboard(user_id: int, batch_number: int, routes: list[dict]):
+    rows = []
+    route_choices = []
+    for route in routes[:50]:
+        route_key = str(route.get("title_key") or "").strip()
+        channel = route.get("individual_channel")
+        if not route_key or not channel:
+            continue
+        route_choices.append(route_key)
+        label = f"{str(route.get('title') or route_key)[:38]} | {str(channel)[:20]}"[:64]
+        rows.append([InlineKeyboardButton(label, callback_data=f"batchch:{batch_number}:{len(route_choices)-1}")])
+    return route_choices, InlineKeyboardMarkup(rows) if rows else None
+
+
+@Client.on_message(filters.private & filters.command(["batch1", "batch2", "batch3", "batch4", "batch5"]), group=-7)
+async def start_manual_batch(client: Client, message):
+    user = getattr(message, "from_user", None)
+    if not user:
+        return
+    if not _is_batch_admin(user):
+        return await message.reply_text("⛔ Owner/admin only.")
+
+    try:
+        parsed = _parse_batch_command(message.text or "")
+    except ValueError as exc:
+        return await message.reply_text(f"❌ {exc}", parse_mode=enums.ParseMode.DISABLED)
+    if not parsed:
+        return
+    batch_number, details = parsed
+
+    active = await _active_batch_task(user.id)
+    if active:
+        active_no = active.get("batch_number", "?")
+        if active.get("status") == "processing" and int(user.id) not in _BATCH_WORKING_USERS:
+            if int(active_no) != batch_number:
+                return await message.reply_text(
+                    f"♻️ Batch{active_no} has unfinished processing. Send /batch{active_no} with its original details to resume it before starting Batch{batch_number}."
+                )
+            # A Render restart can leave a task marked as processing. Reuse its stored
+            # source message IDs and per-file progress rather than leaving it stuck.
+            status_message = await message.reply_text(f"♻️ Resuming unfinished Batch{active_no}…")
+            _BATCH_WORKING_USERS.add(int(user.id))
+            try:
+                await _complete_manual_batch(client, active, status_message)
+            finally:
+                _BATCH_WORKING_USERS.discard(int(user.id))
+            return
+        return await message.reply_text(
+            f"⚠️ Batch{active_no} is currently {active.get('status', 'active').replace('_', ' ')}.\n"
+            "Finish or cancel that task before starting another batch, so uploaded files cannot go to the wrong anime."
+        )
+
+    routes_cursor = codeflixbots.codeflixbots["anime_routes"].find(
+        {"individual_channel": {"$exists": True, "$nin": [None, ""]}}
+    ).sort("title", 1).limit(50)
+    routes = await routes_cursor.to_list(length=50)
+    # Only show routes with a saved title and destination, because a selection must
+    # resolve to an actual configured Anime Post channel.
+    routes = [route for route in routes if route.get("title_key") and route.get("individual_channel")]
+    route_choices, keyboard = await _batch_routes_keyboard(user.id, batch_number, routes)
+    if not route_choices or not keyboard:
+        return await message.reply_text(
+            "❌ No saved Anime Post channels are available yet. Add them first in Admin Panel → Anime Channels."
+        )
+
+    now = datetime.utcnow()
+    task = {
+        "_id": _batch_task_id(user.id, batch_number),
+        "user_id": int(user.id),
+        "batch_number": batch_number,
+        "details": details,
+        "route_choices": route_choices,
+        "selected_route_key": None,
+        "files": [],
+        "status": "choosing_channel",
+        "created_at": now,
+        "updated_at": now,
+    }
+    await _batch_tasks_collection().replace_one({"_id": task["_id"]}, task, upsert=True)
+    await message.reply_text(
+        f"📦 **Batch{batch_number}**\n"
+        f"Anime: {details['title']}\nSeason: {details['season']}\nEpisode: {details['episode_range']}\n\n"
+        "Select the saved anime channel for this post:",
+        reply_markup=keyboard,
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^batchch:[1-5]:\d+$"))
+async def select_manual_batch_channel(client: Client, query: CallbackQuery):
+    if not _is_batch_admin(query.from_user):
+        return await query.answer("Owner/admin only.", show_alert=True)
+    try:
+        _, batch_raw, index_raw = (query.data or "").split(":", 2)
+        batch_number, index = int(batch_raw), int(index_raw)
+    except (ValueError, TypeError):
+        return await query.answer("Invalid batch selection. Start the batch again.", show_alert=True)
+
+    task_id = _batch_task_id(query.from_user.id, batch_number)
+    task = await _batch_tasks_collection().find_one({"_id": task_id, "user_id": int(query.from_user.id)})
+    if not task or task.get("status") != "choosing_channel":
+        return await query.answer("This batch selection has expired. Start the batch again.", show_alert=True)
+    choices = task.get("route_choices") or []
+    if index < 0 or index >= len(choices):
+        return await query.answer("That channel option is no longer available.", show_alert=True)
+    route_key = choices[index]
+    route = await codeflixbots.codeflixbots["anime_routes"].find_one({"title_key": route_key})
+    if not route or not route.get("individual_channel"):
+        return await query.answer("That saved channel could not be found. Please restart the batch.", show_alert=True)
+
+    await _batch_tasks_collection().update_one(
+        {"_id": task_id},
+        {"$set": {"selected_route_key": route_key, "status": "waiting_files", "files": [], "updated_at": datetime.utcnow()}},
+    )
+    details = task.get("details") or {}
+    try:
+        await query.message.edit_text(
+            f"✅ Channel selected: {route.get('title') or route_key}\n"
+            f"📺 Anime: {details.get('title')}\nSeason: {details.get('season')} | Episode: {details.get('episode_range')}\n\n"
+            "📥 Send exactly 3 files now.\nFiles received: 0/3\n\n"
+            "I will begin renaming only after all 3 files arrive, then process them one by one, generate links, and publish automatically.",
+        )
+    except Exception:
+        await query.message.reply_text(
+            f"✅ Channel selected: {route.get('title') or route_key}\n"
+            "📥 Send exactly 3 files now.\nFiles received: 0/3"
+        )
+    await query.answer("Channel selected")
+
+
+@Client.on_message(filters.private & filters.command("cancel"), group=-7)
+async def cancel_manual_batch(client: Client, message):
+    user = getattr(message, "from_user", None)
+    if not user:
+        return
+    task = await _active_batch_task(user.id)
+    if not task:
+        return
+    if task.get("status") == "processing":
+        return await message.reply_text("⏳ This batch is already processing; it cannot be cancelled midway.")
+    await _batch_tasks_collection().update_one(
+        {"_id": task["_id"]},
+        {"$set": {"status": "cancelled", "updated_at": datetime.utcnow()}},
+    )
+    await message.reply_text(f"✅ Batch{task.get('batch_number')} cancelled. No more files will be collected for it.")
+    raise StopPropagation
+
+
+async def _complete_manual_batch(client: Client, task: dict, status_message):
+    user_id = int(task["user_id"])
+    batch_number = int(task["batch_number"])
+    details = dict(task.get("details") or {})
+    details["route_title_key"] = task.get("selected_route_key")
+    source_files = list(task.get("files") or [])
+    completed_ids = {int(value) for value in (task.get("processed_message_ids") or [])}
+    processed = int(task.get("processed_count", len(completed_ids)) or 0)
+    failures = list(task.get("processing_failures") or [])
+    await _batch_tasks_collection().update_one(
+        {"_id": task["_id"]},
+        {"$set": {"status": "processing", "updated_at": datetime.utcnow()}},
+    )
+    for index, source in enumerate(source_files, start=1):
+        source_message_id = int(source.get("message_id", 0))
+        if source_message_id in completed_ids:
+            continue
+        file_error = None
+        try:
+            file_message = await client.get_messages(int(source["chat_id"]), source_message_id)
+            if not file_message or getattr(file_message, "empty", False):
+                raise RuntimeError("Telegram source message could not be loaded")
+            await _safe_edit(status_message, f"⚙️ Batch{batch_number}: processing file {index}/3…\nRenaming → File Store → link generation → publishing")
+            await auto_rename_files(client, file_message, _details=details)
+            processed += 1
+        except Exception as exc:
+            logger.exception("Batch%s failed while processing source file %s", batch_number, index)
+            file_error = f"File {index}: {type(exc).__name__}: {exc}"
+            failures.append(file_error)
+        # Persist each finished attempt so a restart can continue with later uploads.
+        completed_ids.add(source_message_id)
+        await _batch_tasks_collection().update_one(
+            {"_id": task["_id"]},
+            {"$set": {
+                "processed_message_ids": sorted(completed_ids),
+                "processed_count": processed,
+                "processing_failures": failures,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+    title_key = normalize_anime_title(str(details.get("title") or ""))
+    episode_batches = codeflixbots.codeflixbots["episode_batches"]
+    cursor = episode_batches.find({
+        "title_key": title_key,
+        "season": str(details.get("season") or ""),
+        "episode": str(details.get("episode_range") or ""),
+        "state": {"$ne": "merged"},
+    }).sort("updated_at", -1).limit(1)
+    rows = await cursor.to_list(length=1)
+    published_batch = rows[0] if rows else None
+    published_targets = (published_batch or {}).get("published_targets") or {}
+    route_key = task.get("selected_route_key")
+    selected_route = await codeflixbots.codeflixbots["anime_routes"].find_one({"title_key": route_key}) if route_key else None
+    individual_target = (selected_route or {}).get("individual_channel")
+    ongoing_targets = (selected_route or {}).get("ongoing_channels") or (
+        [(selected_route or {}).get("ongoing_channel")] if (selected_route or {}).get("ongoing_channel") else []
+    )
+    individual_done = bool(individual_target and published_targets.get(f"individual:{individual_target}"))
+    ongoing_done = sum(1 for target in ongoing_targets if target and published_targets.get(f"ongoing:{target}"))
+    links_ready = bool(published_batch and all((published_batch.get("files") or {}).get("q" + quality, {}).get("url") for quality in ("480p", "720p", "1080p")))
+
+    summary_lines = [
+        f"📦 Batch{batch_number} processing finished.",
+        f"📺 Anime: {details.get('title')}",
+        f"Season {details.get('season')} • Episode {details.get('episode_range')}",
+        f"📁 Files processed: {processed}/3",
+        f"🔗 Access links: {'Ready' if links_ready else 'Not ready — check that filenames contain 480p, 720p, and 1080p.'}",
+        f"📣 Anime channel: {'Successfully posted' if individual_done else 'Not confirmed'}",
+        f"📡 Ongoing: {ongoing_done}/{len([target for target in ongoing_targets if target])} channels published",
+    ]
+    if failures:
+        summary_lines.append("\n⚠️ Issues:\n" + "\n".join(failures[:3]))
+    if processed == 3 and published_batch and published_batch.get("state") == "published" and individual_done and ongoing_done == len([target for target in ongoing_targets if target]):
+        final_status = "completed"
+        summary_lines.append("\n✅ Successfully posted to the Anime channel and configured ongoing channels.")
+    elif processed == 3 and individual_done:
+        final_status = "completed_with_warnings"
+        summary_lines.append("\n⚠️ Anime post succeeded, but check the ongoing status or link-quality filenames above.")
+    else:
+        final_status = "completed_with_errors"
+        summary_lines.append("\n❌ Posting was not fully confirmed. Check the file status messages above and bot logs.")
+
+    await _batch_tasks_collection().update_one(
+        {"_id": task["_id"]},
+        {"$set": {"status": final_status, "processed_count": processed, "finished_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
+    )
+    await _safe_edit(status_message, "\n".join(summary_lines))
+
+
 async def _prompt_for_next_file(client, user_id: int):
     queue = _MEDIA_QUEUES.get(user_id) or []
     if queue and user_id not in _MEDIA_WAITING_DETAILS and user_id not in _MEDIA_PROCESSING:
@@ -132,7 +438,12 @@ async def collect_upload_details(client: Client, message):
     if not user or user.id not in _MEDIA_WAITING_DETAILS:
         return
     text = (message.text or "").strip()
+    if re.match(r"^/batch[1-5](?:@\w+)?(?:\s|$)", text, re.I):
+        return
     if re.match(r"^/cancel(?:@\w+)?(?:\s|$)", text, re.I):
+        # Let the manual-batch cancel handler own /cancel when a batch is active.
+        if await _active_batch_task(user.id):
+            return
         _MEDIA_WAITING_DETAILS.discard(user.id)
         _MEDIA_QUEUES.pop(user.id, None)
         await message.reply_text("✅ Waiting file queue cancelled. Your original files were not renamed.")
@@ -265,6 +576,63 @@ async def auto_rename_files(client, message, _details: dict | None = None):
         return
     user_id = user.id
     if _details is None:
+        batch_to_process = None
+        batch_status_message = None
+        async with _BATCH_TASK_LOCKS[user_id]:
+            batch_task = await _active_batch_task(user_id)
+            if batch_task and batch_task.get("status") == "choosing_channel":
+                await message.reply_text("⚠️ Select an anime channel from the buttons first. Then send the 3 files.")
+                raise StopPropagation
+            if batch_task and batch_task.get("status") == "processing":
+                await message.reply_text(f"⏳ Batch{batch_task.get('batch_number')} is processing its queued files. Please wait for it to finish.")
+                raise StopPropagation
+            if batch_task and batch_task.get("status") == "waiting_files":
+                incoming = batch_task.get("files") or []
+                message_id = int(getattr(message, "id", 0) or 0)
+                if any(int(item.get("message_id", -1)) == message_id for item in incoming):
+                    raise StopPropagation
+                if len(incoming) >= _BATCH_FILE_LIMIT:
+                    await message.reply_text("✅ This batch already has 3/3 files. Please wait while they are processed.")
+                    raise StopPropagation
+                source_info = {
+                    "chat_id": int(message.chat.id),
+                    "message_id": message_id,
+                    "file_name": getattr(getattr(message, "document", None), "file_name", None)
+                        or getattr(getattr(message, "video", None), "file_name", None)
+                        or getattr(getattr(message, "audio", None), "file_name", None)
+                        or f"file_{message_id}",
+                    "file_id": getattr(getattr(message, "document", None), "file_id", None)
+                        or getattr(getattr(message, "video", None), "file_id", None)
+                        or getattr(getattr(message, "audio", None), "file_id", None),
+                }
+                incoming.append(source_info)
+                incoming.sort(key=lambda item: int(item.get("message_id", 0)))
+                new_count = len(incoming)
+                new_status = "processing" if new_count == _BATCH_FILE_LIMIT else "waiting_files"
+                await _batch_tasks_collection().update_one(
+                    {"_id": batch_task["_id"], "status": "waiting_files"},
+                    {"$set": {"files": incoming, "status": new_status, "updated_at": datetime.utcnow()}},
+                )
+                if new_count < _BATCH_FILE_LIMIT:
+                    await message.reply_text(
+                        f"📥 Batch{batch_task.get('batch_number')} files received: {new_count}/3\n"
+                        f"Send {3-new_count} more file(s). Processing starts only after all 3 arrive."
+                    )
+                    raise StopPropagation
+                batch_status_message = await message.reply_text(
+                    f"✅ Batch{batch_task.get('batch_number')}: files received 3/3.\n"
+                    "⏳ Starting sequential processing now…"
+                )
+                batch_to_process = {**batch_task, "files": incoming, "status": "processing"}
+
+        if batch_to_process is not None:
+            _BATCH_WORKING_USERS.add(int(user_id))
+            try:
+                await _complete_manual_batch(client, batch_to_process, batch_status_message)
+            finally:
+                _BATCH_WORKING_USERS.discard(int(user_id))
+            raise StopPropagation
+
         queue = _MEDIA_QUEUES[user_id]
         if not any(getattr(item, "id", None) == getattr(message, "id", None) for item in queue):
             queue.append(message)
