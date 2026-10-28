@@ -612,7 +612,12 @@ async def publish_ready_batch(client, batch: dict) -> str:
             expected = []
             if current_route.get("individual_channel"):
                 expected.append(f"individual:{current_route['individual_channel']}")
-            ongoing = current_route.get("ongoing_channels") or ([current_route.get("ongoing_channel")] if current_route.get("ongoing_channel") else [])
+            # Resolve the same destination list used by the publisher. This includes
+            # globally configured ongoing channels when the anime has no per-route
+            # ongoing assignment. Without this, a batch could be marked "already
+            # published" after only the individual channel succeeded, even if a new
+            # global ongoing destination had never received the post.
+            ongoing = await _resolve_ongoing_targets(current_route)
             expected.extend(f"ongoing:{target}" for target in ongoing if target)
             if expected and all(published_targets.get(key) for key in expected):
                 return "✅ This episode has already been published to all configured channels; duplicate post prevented."
@@ -971,10 +976,12 @@ async def list_anime_channels(client, message):
     cursor = codeflixbots.codeflixbots["anime_routes"].find({}).sort("title", 1)
     lines = []
     async for route in cursor:
+        ongoing = route.get("ongoing_channels") or ([route.get("ongoing_channel")] if route.get("ongoing_channel") else [])
+        ongoing_text = ", ".join(str(target) for target in ongoing) if ongoing else "Global fallback / Not assigned"
         lines.append(
             f"• {route.get('title', '(unknown)')}\n"
             f"  Individual: {route.get('individual_channel') or 'Not set'}\n"
-            f"  Ongoing: {route.get('ongoing_channel') or 'Not set'}"
+            f"  Ongoing: {ongoing_text}"
         )
     await message.reply_text("\n\n".join(lines) if lines else "No anime channel routes saved yet.")
 

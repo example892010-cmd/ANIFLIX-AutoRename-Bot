@@ -30,7 +30,7 @@ from helper.file_names import (
 )
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
-from plugins.episode_publisher import store_file_and_process
+from plugins.episode_publisher import _batch_id, store_file_and_process
 from plugins.ongoing_posts import _targets_with_global_fallback as _resolve_ongoing_targets
 
 logger = logging.getLogger(__name__)
@@ -405,6 +405,28 @@ async def cancel_manual_batch(client: Client, message):
     raise StopPropagation
 
 
+
+async def _recorded_post_exists(client: Client, record: dict | None) -> bool:
+    """Return true only when a saved channel post can still be fetched from Telegram."""
+    if not isinstance(record, dict):
+        return False
+    chat_id = record.get("chat_id")
+    message_id = record.get("message_id")
+    if chat_id is None or message_id is None:
+        return False
+    try:
+        target = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
+        posted = await client.get_messages(target, int(message_id))
+        if isinstance(posted, (list, tuple)):
+            posted = posted[0] if posted else None
+        return bool(posted and not getattr(posted, "empty", False))
+    except Exception as exc:
+        # A fetch/permission error is not proof that the post exists; never show a
+        # success badge solely because MongoDB has an old published_targets entry.
+        logger.warning("Could not verify recorded channel post %s: %s", message_id, exc)
+        return False
+
+
 async def _complete_manual_batch(client: Client, task: dict, status_message):
     user_id = int(task["user_id"])
     batch_number = int(task["batch_number"])
@@ -423,19 +445,43 @@ async def _complete_manual_batch(client: Client, task: dict, status_message):
         if source_message_id in completed_ids:
             continue
         file_error = None
+        file_completed = False
         try:
             file_message = await client.get_messages(int(source["chat_id"]), source_message_id)
             if not file_message or getattr(file_message, "empty", False):
                 raise RuntimeError("Telegram source message could not be loaded")
             await _safe_edit(status_message, f"⚙️ Batch{batch_number}: processing file {index}/3…\nRenaming → File Store → link generation → publishing")
-            await auto_rename_files(client, file_message, _details=details)
+            operation_result = await auto_rename_files(client, file_message, _details=details)
+            if isinstance(operation_result, str):
+                result_text = operation_result.strip()
+            else:
+                result_text = str(getattr(operation_result, "text", "") or getattr(operation_result, "caption", "") or "").strip()
+
+            # The rename handler used to swallow failures and return None, causing this
+            # loop to count failed work as completed. Count only a real storage result.
+            if result_text.startswith("✅"):
+                file_completed = True
+            elif result_text.startswith("⚠️") and any(marker in result_text for marker in (
+                "Files are stored and links are generated",
+                "Not published:",
+                "All 3 files are stored and verified",
+                "verified, but its access link could not be saved",
+            )):
+                # Storage completed, but a later publishing/link step needs attention.
+                file_completed = True
+                failures.append(f"File {index}: {result_text[:220]}")
+            else:
+                raise RuntimeError(result_text or "File processing returned no success result")
             processed += 1
         except Exception as exc:
             logger.exception("Batch%s failed while processing source file %s", batch_number, index)
             file_error = f"File {index}: {type(exc).__name__}: {exc}"
             failures.append(file_error)
-        # Persist each finished attempt so a restart can continue with later uploads.
-        completed_ids.add(source_message_id)
+        # Only successful inputs are marked complete. Unfinished ones remain resumable.
+        if file_completed:
+            completed_ids.add(source_message_id)
+        else:
+            completed_ids.discard(source_message_id)
         await _batch_tasks_collection().update_one(
             {"_id": task["_id"]},
             {"$set": {
@@ -447,22 +493,52 @@ async def _complete_manual_batch(client: Client, task: dict, status_message):
         )
 
     title_key = normalize_anime_title(str(details.get("title") or ""))
+    # Canonicalize the same way episode_publisher does (e.g. Season 01 / Episode 04
+    # are saved as season "1" / episode "4"). The previous query used raw form input
+    # and could miss the exact batch or select an unrelated historical record.
+    season_value = str(details.get("season") or "").strip()
+    episode_value = str(details.get("episode_range") or "").strip()
+    try:
+        season_value = str(int(season_value)) if season_value else ""
+    except ValueError:
+        pass
+    episode_match = re.fullmatch(r"\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*", episode_value)
+    if episode_match:
+        first_episode = str(int(episode_match.group(1)))
+        last_episode = str(int(episode_match.group(2))) if episode_match.group(2) else None
+        episode_value = f"{first_episode}-{last_episode}" if last_episode and last_episode != first_episode else first_episode
+
     episode_batches = codeflixbots.codeflixbots["episode_batches"]
-    cursor = episode_batches.find({
-        "title_key": title_key,
-        "season": str(details.get("season") or ""),
-        "episode": str(details.get("episode_range") or ""),
-        "state": {"$ne": "merged"},
-    }).sort("updated_at", -1).limit(1)
-    rows = await cursor.to_list(length=1)
-    published_batch = rows[0] if rows else None
+    published_batch = None
+    if title_key and season_value and episode_value:
+        exact_id = _batch_id(title_key, season_value, episode_value)
+        published_batch = await episode_batches.find_one({"_id": exact_id, "state": {"$ne": "merged"}})
+    if not published_batch:
+        query = {
+            "season": season_value,
+            "episode": episode_value,
+            "state": {"$ne": "merged"},
+        }
+        if task.get("selected_route_key"):
+            # Manual batches are explicitly bound to the selected route; use that
+            # stable key first rather than the user-entered title spelling.
+            query["route_title_key"] = task.get("selected_route_key")
+        else:
+            query["title_key"] = title_key
+        cursor = episode_batches.find(query).sort("updated_at", -1).limit(1)
+        rows = await cursor.to_list(length=1)
+        published_batch = rows[0] if rows else None
     published_targets = (published_batch or {}).get("published_targets") or {}
     route_key = task.get("selected_route_key")
     selected_route = await codeflixbots.codeflixbots["anime_routes"].find_one({"title_key": route_key}) if route_key else None
     individual_target = (selected_route or {}).get("individual_channel")
     ongoing_targets = await _resolve_ongoing_targets(selected_route or {}) if selected_route else []
-    individual_done = bool(individual_target and published_targets.get(f"individual:{individual_target}"))
-    ongoing_done = sum(1 for target in ongoing_targets if target and published_targets.get(f"ongoing:{target}"))
+    individual_record = published_targets.get(f"individual:{individual_target}") if individual_target else None
+    individual_done = await _recorded_post_exists(client, individual_record)
+    ongoing_done = 0
+    for target in ongoing_targets:
+        if target and await _recorded_post_exists(client, published_targets.get(f"ongoing:{target}")):
+            ongoing_done += 1
     links_ready = bool(published_batch and all((published_batch.get("files") or {}).get("q" + quality, {}).get("url") for quality in ("480p", "720p", "1080p")))
 
     summary_lines = [
@@ -471,20 +547,28 @@ async def _complete_manual_batch(client: Client, task: dict, status_message):
         f"Season {details.get('season')} • Episode {details.get('episode_range')}",
         f"📁 Files processed: {processed}/3",
         f"🔗 Access links: {'Ready' if links_ready else 'Not ready — check that filenames contain 480p, 720p, and 1080p.'}",
-        f"📣 Anime channel: {'Successfully posted' if individual_done else 'Not confirmed'}",
+        f"📣 Anime channel: {'Confirmed posted' if individual_done else 'Not confirmed'}",
         f"📡 Ongoing: {ongoing_done}/{len([target for target in ongoing_targets if target])} channels published",
     ]
+    batch_error = str((published_batch or {}).get("last_error") or "").strip()
+    if batch_error:
+        failures.append("Publisher: " + batch_error[:500])
     if failures:
-        summary_lines.append("\n⚠️ Issues:\n" + "\n".join(failures[:3]))
-    if processed == 3 and published_batch and published_batch.get("state") == "published" and individual_done and ongoing_done == len([target for target in ongoing_targets if target]):
+        summary_lines.append("\n⚠️ Issues:\n" + "\n".join(failures[:4]))
+
+    retry_required = any(int(source.get("message_id", 0)) not in completed_ids for source in source_files)
+    if retry_required:
+        final_status = "processing"
+        summary_lines.append(f"\n♻️ One or more files did not finish. Send /batch{batch_number} again to retry the unfinished file(s).")
+    elif processed == 3 and published_batch and published_batch.get("state") == "published" and individual_done and ongoing_done == len([target for target in ongoing_targets if target]):
         final_status = "completed"
-        summary_lines.append("\n✅ Successfully posted to the Anime channel and configured ongoing channels.")
+        summary_lines.append("\n✅ Telegram confirms the post messages exist in the configured channels.")
     elif processed == 3 and individual_done:
         final_status = "completed_with_warnings"
-        summary_lines.append("\n⚠️ Anime post succeeded, but check the ongoing status or link-quality filenames above.")
+        summary_lines.append("\n⚠️ Anime post is confirmed, but check the ongoing status or publisher issue above.")
     else:
         final_status = "completed_with_errors"
-        summary_lines.append("\n❌ Posting was not fully confirmed. Check the file status messages above and bot logs.")
+        summary_lines.append("\n❌ Posting was not fully confirmed. Check the publisher issue above and Render logs.")
 
     await _batch_tasks_collection().update_one(
         {"_id": task["_id"]},
@@ -907,19 +991,20 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             timings.get("thumbnail", 0.0), timings.get("upload", 0.0), timings["total"],
             metadata_enabled(meta_state), new_filename,
         )
-        await _safe_edit(
-            status,
-            storage_result or "✅ Done! File renamed successfully.",
-        )
+        final_result = storage_result or "✅ Done! File renamed successfully."
+        await _safe_edit(status, final_result)
         logger.info("Renamed %s -> %s for user %s", original_name, new_filename, user_id)
+        return final_result
 
     except FloodWait as exc:
         wait_seconds = int(getattr(exc, "value", 1))
         logger.warning("Flood wait while processing for user %s: %s seconds", user_id, wait_seconds)
+        error_text = f"⏳ Telegram rate limit. Please try again in {wait_seconds} seconds."
         if status:
-            await _safe_edit(status, f"⏳ Telegram rate limit. Please try again in {wait_seconds} seconds.")
+            await _safe_edit(status, error_text)
         else:
-            await message.reply_text(f"⏳ Telegram rate limit. Please try again in {wait_seconds} seconds.")
+            await message.reply_text(error_text)
+        return error_text
     except Exception as exc:
         logger.exception("File processing failed for user %s (%s)", user_id, original_name)
         error_text = f"❌ File processing failed: {type(exc).__name__}: {exc}"
@@ -927,5 +1012,6 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             await _safe_edit(status, error_text[:3900])
         else:
             await message.reply_text(error_text[:3900], parse_mode=enums.ParseMode.DISABLED)
+        return error_text
     finally:
         renaming_operations.pop(file_id, None)
