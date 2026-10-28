@@ -180,7 +180,7 @@ def _admin_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📺 Anime Channels", callback_data="adm:anime_channels"), InlineKeyboardButton("🔗 Anime Invite Links", callback_data="adm:invites")],
         [InlineKeyboardButton("🎬 Episode Manager", callback_data="adm:episode_manager"), InlineKeyboardButton("✅ Link Verification", callback_data="adm:verify_links")],
-        [InlineKeyboardButton("📚 Templates", callback_data="adm:templates"), InlineKeyboardButton("📝 Post Text", callback_data="adm:post_customization")],
+        [InlineKeyboardButton("🖼️ Ongoing Template", callback_data="adm:templates"), InlineKeyboardButton("📝 Ongoing Post Text", callback_data="adm:post_customization")],
         [InlineKeyboardButton("🔘 Ongoing Buttons", callback_data="adm:ongoing_buttons")],
         [InlineKeyboardButton("📡 Ongoing Channels", callback_data="adm:ongoing_channels"), InlineKeyboardButton("🔒 Force Subscribe", callback_data="adm:fsub")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings")],
@@ -235,11 +235,10 @@ def _menu_keyboard(menu: str):
             [InlineKeyboardButton("🔄 Refresh Template", callback_data="adm:ongoing_buttons_refresh")],
         ]
     elif menu == "templates":
+        # Ongoing Template manages anime-specific posters only. Text stays in Post Text.
         rows = [
-            [InlineKeyboardButton("➕ Create Template", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Template", callback_data="adm:template_edit")],
-            [InlineKeyboardButton("📋 View Templates", callback_data="adm:template_list")],
-            [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
-            [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
+            [InlineKeyboardButton("➕ Add Anime Poster", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Anime Poster", callback_data="adm:template_edit")],
+            [InlineKeyboardButton("📋 View Saved Posters", callback_data="adm:template_list")],
         ]
     else:
         rows = []
@@ -493,10 +492,10 @@ async def _global_post_templates():
 
 async def _saved_templates_text():
     cursor = codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find({}).sort("title", 1).limit(100)
-    lines = ["📚 Saved Anime Templates"]
+    lines = ["🖼️ Saved Ongoing Posters"]
     async for item in cursor:
         lines.append(f"• {item.get('title', '(unnamed)')} — {'Poster saved' if item.get('poster_file_id') else 'No poster'}")
-    return "\n".join(lines) if len(lines) > 1 else "No templates saved yet. Tap Create Template to add one."
+    return "\n".join(lines) if len(lines) > 1 else "No posters saved yet. Tap Add Anime Poster to add one."
 
 
 async def _ongoing_buttons_summary():
@@ -1187,7 +1186,7 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             "Send the complete ongoing-button template, one button per line.\n\n"
             "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
             "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1\n\n"
-            "Use #b for blue, #r for red, #g for green. {anime_invite} is replaced with the invite link saved for whichever anime is being posted. This template is shared by all ongoing channels."
+            "Use #b, #r, or #g as style markers. {anime_invite} is replaced with the matching anime's saved invite link (prefer a link named Download, otherwise the first saved link). If no invite is saved, that button is skipped. Quality buttons are not added to ongoing posts. This template is shared by all ongoing channels."
         )
     elif action == "main_ongoing_text":
         await _prompt(client, user.id, "main_ongoing_text", "Send the shared Main Ongoing Post Text. This text is used for every anime; placeholders such as {title}, {season}, {episode_range}, {status}, and {qualities} are replaced automatically.")
