@@ -480,7 +480,7 @@ async def _ongoing_channels_text():
     lines = [f"📡 Ongoing Channels ({len(channels)}/{MAX_ONGOING_CHANNELS})"]
     for index, channel in enumerate(channels, start=1):
         lines.append(f"{index}. {channel.get('title') or channel.get('chat_id')} — {channel.get('chat_id')}")
-    lines.append("\nThese channels are used automatically for ongoing posts when an anime has no specific ongoing destinations assigned. Anime-specific assignments take priority. The bot must be admin in every channel it posts to.")
+    lines.append("\nAssign one or more of these IDs in Anime Channels. The bot must be admin in every channel it posts to.")
     return "\n".join(lines)
 
 
