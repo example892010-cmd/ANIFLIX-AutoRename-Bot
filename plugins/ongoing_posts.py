@@ -14,6 +14,7 @@ from config import Config
 from helper.auth import is_admin_user
 from helper.database import codeflixbots
 from helper.file_names import normalize_anime_title
+from helper.channel_routing import assigned_ongoing_targets, resolve_ongoing_targets
 
 logger = logging.getLogger(__name__)
 DEFAULT_ONGOING_TEMPLATE = (
@@ -52,18 +53,13 @@ def _render_template(template: str, values: dict[str, Any], limit: int = 4096) -
 
 
 def _targets(route: dict) -> list[Any]:
-    values = route.get("ongoing_channels") or []
-    if not values and route.get("ongoing_channel"):
-        values = [route.get("ongoing_channel")]
-    result, seen = [], set()
-    for value in values:
-        if value is None or not str(value).strip():
-            continue
-        key = str(value).casefold()
-        if key not in seen:
-            seen.add(key)
-            result.append(value)
-    return result[:6]
+    """Return anime-specific ongoing targets, if any."""
+    return assigned_ongoing_targets(route)
+
+
+async def _targets_with_global_fallback(route: dict) -> list[Any]:
+    """Use anime-specific destinations first, then the admin's global ongoing list."""
+    return await resolve_ongoing_targets(route, codeflixbots.codeflixbots)
 
 
 def _plain_label(value: str) -> str:
@@ -209,9 +205,9 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
     except ValueError as exc:
         return f"❌ Ongoing button template error: {exc}"
 
-    targets = _targets(route)
+    targets = await _targets_with_global_fallback(route)
     if not targets:
-        return f"❌ No ongoing channel is assigned to {route.get('title', title)}. Configure it in Admin Panel → Anime Channels."
+        return f"❌ No ongoing channels are configured. Add one in Admin Panel → Ongoing Channels or assign destinations in Anime Channels."
 
     details = route.get("ongoing_details") or {}
     qualities = details.get("qualities") or "480p, 720p, 1080p"

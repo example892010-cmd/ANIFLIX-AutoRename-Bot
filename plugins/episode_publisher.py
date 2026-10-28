@@ -26,6 +26,11 @@ from helper.file_names import (
     extract_title,
     normalize_anime_title,
 )
+from plugins.ongoing_posts import (
+    _build_button_rows as _build_ongoing_button_rows,
+    _send_bot_api as _send_ongoing_bot_api,
+    _targets_with_global_fallback as _resolve_ongoing_targets,
+)
 
 logger = logging.getLogger(__name__)
 EXPECTED_QUALITIES = ("480p", "720p", "1080p")
@@ -153,97 +158,10 @@ def _link_summary(files: dict[str, Any]) -> str:
 
 
 def _buttons(files: dict[str, Any]) -> InlineKeyboardMarkup:
-    """Quality buttons for the individual Anime Post only."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(q, url=files[_quality_field(q)]["url"])
         for q in EXPECTED_QUALITIES
     ]])
-
-
-DEFAULT_ONGOING_BUTTONS_TEMPLATE = (
-    "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
-    "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1"
-)
-
-
-def _render_ongoing_button_rows(template: str, invite_url: str | None,
-                                title: str = "") -> list[list[InlineKeyboardButton]]:
-    """Build the saved ongoing button template without adding quality buttons.
-
-    Each line is one row. Multiple entries can share a row by separating them
-    with `` | ``. ``#b``, ``#r`` and ``#g`` are template markers; Telegram's
-    standard inline keyboard API does not expose background-colour styling, so
-    the markers are removed from the displayed button labels.
-    """
-    rows: list[list[InlineKeyboardButton]] = []
-    for line in str(template or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        row: list[InlineKeyboardButton] = []
-        for item in line.split(" | "):
-            match = re.match(r"^#([bgr])\s+(.+?)\s+-\s*(.+)$", item.strip(), re.IGNORECASE)
-            if not match:
-                logger.warning("Skipping invalid ongoing button template line: %s", item)
-                continue
-            _style, label, raw_url = match.groups()
-            url = raw_url.strip()
-            replacements = {
-                "{anime_invite}": invite_url or "",
-                "{title}": title,
-                "{anime}": title,
-            }
-            for placeholder, value in replacements.items():
-                url = url.replace(placeholder, value)
-            label = label.replace("{title}", title).replace("{anime}", title).strip()
-            # Never create a broken button when no invite link was saved for this anime.
-            if "{" in url or "}" in url or not url:
-                logger.warning("Skipping ongoing button '%s': a template placeholder has no value", label)
-                continue
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                logger.warning("Skipping ongoing button '%s': invalid URL", label)
-                continue
-            if not label or len(label) > 64:
-                logger.warning("Skipping ongoing button with an invalid label length")
-                continue
-            row.append(InlineKeyboardButton(text=label, url=url))
-        if row:
-            rows.append(row)
-    return rows
-
-
-async def _ongoing_keyboard(title: str) -> InlineKeyboardMarkup | None:
-    """Load the global button template and the invite URL for this exact anime."""
-    settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
-    template = settings.get("ongoing_buttons_template") or DEFAULT_ONGOING_BUTTONS_TEMPLATE
-
-    title_key = _title_key(title)
-    invites = codeflixbots.codeflixbots["anime_invite_links"]
-    invite_doc = await invites.find_one({"_id": title_key})
-    if not invite_doc:
-        invite_doc = await invites.find_one({"title_key": title_key})
-    invite_url = None
-    if invite_doc:
-        saved_links = invite_doc.get("links") or []
-        valid_links = [row for row in saved_links if isinstance(row, dict) and str(row.get("url") or "").startswith(("https://", "http://"))]
-        # Prefer a link whose saved label mentions Download; otherwise use the first
-        # link saved for this anime, preserving the order chosen in the admin panel.
-        chosen = next((row for row in valid_links if "download" in str(row.get("label") or "").casefold()), None)
-        if chosen is None and valid_links:
-            chosen = valid_links[0]
-        if chosen:
-            invite_url = str(chosen.get("url") or "").strip()
-        else:
-            for field in ("invite_url", "direct_url", "url"):
-                candidate = str(invite_doc.get(field) or "").strip()
-                if candidate.startswith(("https://", "http://")):
-                    invite_url = candidate
-                    break
-
-    rows = _render_ongoing_button_rows(template, invite_url, title=title)
-    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def _render_post(route: dict, mode: str, title: str, season: str, episode: str,
@@ -333,7 +251,17 @@ async def _send_target(client, route: dict, batch: dict, mode: str, target_overr
     if published.get(target_key):
         return True, "already published"
 
-    chat = await client.get_chat(target)
+    chat = None
+    if mode == "individual":
+        chat = await client.get_chat(target)
+    else:
+        # Public usernames can be resolved for a real chat ID; private numeric IDs
+        # are intentionally sent through Bot API and do not require Pyrogram's peer cache.
+        try:
+            chat = await client.get_chat(target)
+        except Exception:
+            if not (isinstance(target, int) or (isinstance(target, str) and target.lstrip("-").isdigit())):
+                raise
     title = batch["title"]
     season = batch["season"]
     episode = batch["episode"]
@@ -345,13 +273,28 @@ async def _send_target(client, route: dict, batch: dict, mode: str, target_overr
     else:
         route["ongoing_template"] = global_templates.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
     caption = _render_post(route, mode, title, season, episode, files)
-    # Ongoing posts use the owner-editable button template and the matching
-    # anime's saved invite link. Quality buttons remain exclusive to Anime Posts.
-    keyboard = _buttons(files) if mode == "individual" else await _ongoing_keyboard(title)
+    keyboard = _buttons(files)
     poster_file_id = None
     if mode == "ongoing":
         named_template = await codeflixbots.codeflixbots["anime_templates"].find_one({"_id": _title_key(title)}) or {}
         poster_file_id = named_template.get("poster_file_id") or route.get("poster_file_id")
+        invite_doc = await codeflixbots.codeflixbots["anime_invite_links"].find_one({"_id": route.get("title_key") or _title_key(title)}) or {}
+        invite_links = list(invite_doc.get("links") or [])
+        post_settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
+        button_template = post_settings.get("ongoing_buttons_template") or "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1"
+        keyboard = _build_ongoing_button_rows(button_template, invite_links)
+        api_target = int(target) if isinstance(target, str) and target.lstrip("-").isdigit() else target
+        sent_id = await _send_ongoing_bot_api(client, api_target, poster_file_id, caption, keyboard)
+        stored_chat_id = int(chat.id) if chat is not None else (int(target) if isinstance(target, int) or (isinstance(target, str) and target.lstrip("-").isdigit()) else str(target))
+        await codeflixbots.codeflixbots["episode_batches"].update_one(
+            {"_id": batch["_id"]},
+            {"$set": {
+                f"published_targets.{target_key}": {"chat_id": stored_chat_id, "message_id": int(sent_id), "published_at": _now()},
+                "updated_at": _now(),
+            }},
+        )
+        logger.info("Published %s S%sE%s to ongoing %s as message %s", title, season, episode, target, sent_id)
+        return True, "published"
 
     try:
         if poster_file_id:
@@ -476,23 +419,7 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
         )
 
     individual_target = route.get("individual_channel")
-    ongoing_targets = route.get("ongoing_channels") or ([route.get("ongoing_channel")] if route.get("ongoing_channel") else [])
-
-    # The admin panel also supports a shared/global list of ongoing channels.
-    # Anime-channel forward setup saves only the individual channel, so use the
-    # configured global ongoing destinations when this anime has no per-anime list.
-    if not ongoing_targets:
-        try:
-            global_ongoing = await codeflixbots.codeflixbots["ongoing_channel_settings"].find_one({"_id": "global"}) or {}
-            for channel in global_ongoing.get("channels") or []:
-                if not isinstance(channel, dict) or channel.get("active", True) is False:
-                    continue
-                candidate = channel.get("chat_id") or channel.get("target") or channel.get("username")
-                if candidate:
-                    ongoing_targets.append(candidate)
-        except Exception:
-            logger.exception("Could not load the shared ongoing-channel list")
-
+    ongoing_targets = await _resolve_ongoing_targets(route)
     # Preserve order and avoid sending twice if the same channel was assigned in both fields.
     unique_ongoing = []
     seen_ongoing = set()

@@ -180,7 +180,7 @@ def _admin_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📺 Anime Channels", callback_data="adm:anime_channels"), InlineKeyboardButton("🔗 Anime Invite Links", callback_data="adm:invites")],
         [InlineKeyboardButton("🎬 Episode Manager", callback_data="adm:episode_manager"), InlineKeyboardButton("✅ Link Verification", callback_data="adm:verify_links")],
-        [InlineKeyboardButton("🖼️ Ongoing Template", callback_data="adm:templates"), InlineKeyboardButton("📝 Ongoing Post Text", callback_data="adm:post_customization")],
+        [InlineKeyboardButton("📚 Templates", callback_data="adm:templates"), InlineKeyboardButton("📝 Post Text", callback_data="adm:post_customization")],
         [InlineKeyboardButton("🔘 Ongoing Buttons", callback_data="adm:ongoing_buttons")],
         [InlineKeyboardButton("📡 Ongoing Channels", callback_data="adm:ongoing_channels"), InlineKeyboardButton("🔒 Force Subscribe", callback_data="adm:fsub")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings")],
@@ -205,7 +205,6 @@ def _menu_keyboard(menu: str):
         rows = [
             [InlineKeyboardButton("➕ Add Channel", callback_data="adm:oc_add"), InlineKeyboardButton("✏️ Edit Channel", callback_data="adm:oc_edit")],
             [InlineKeyboardButton("➖ Remove Channel", callback_data="adm:oc_remove"), InlineKeyboardButton("📋 View Channels", callback_data="adm:oc_list")],
-            [InlineKeyboardButton("🗑️ Clear All Added Channels", callback_data="adm:oc_clear_all")],
             [InlineKeyboardButton("🎯 Assign to Anime", callback_data="adm:route_edit")],
         ]
     elif menu == "fsub":
@@ -235,10 +234,11 @@ def _menu_keyboard(menu: str):
             [InlineKeyboardButton("🔄 Refresh Template", callback_data="adm:ongoing_buttons_refresh")],
         ]
     elif menu == "templates":
-        # Ongoing Template manages anime-specific posters only. Text stays in Post Text.
         rows = [
-            [InlineKeyboardButton("➕ Add Anime Poster", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Anime Poster", callback_data="adm:template_edit")],
-            [InlineKeyboardButton("📋 View Saved Posters", callback_data="adm:template_list")],
+            [InlineKeyboardButton("➕ Create Template", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Template", callback_data="adm:template_edit")],
+            [InlineKeyboardButton("📋 View Templates", callback_data="adm:template_list")],
+            [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
+            [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
         ]
     else:
         rows = []
@@ -480,7 +480,7 @@ async def _ongoing_channels_text():
     lines = [f"📡 Ongoing Channels ({len(channels)}/{MAX_ONGOING_CHANNELS})"]
     for index, channel in enumerate(channels, start=1):
         lines.append(f"{index}. {channel.get('title') or channel.get('chat_id')} — {channel.get('chat_id')}")
-    lines.append("\nAssign one or more of these IDs in Anime Channels. The bot must be admin in every channel it posts to.")
+    lines.append("\nThese channels are used automatically for ongoing posts when an anime has no specific ongoing destinations assigned. Anime-specific assignments take priority. The bot must be admin in every channel it posts to.")
     return "\n".join(lines)
 
 
@@ -492,10 +492,10 @@ async def _global_post_templates():
 
 async def _saved_templates_text():
     cursor = codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find({}).sort("title", 1).limit(100)
-    lines = ["🖼️ Saved Ongoing Posters"]
+    lines = ["📚 Saved Anime Templates"]
     async for item in cursor:
         lines.append(f"• {item.get('title', '(unnamed)')} — {'Poster saved' if item.get('poster_file_id') else 'No poster'}")
-    return "\n".join(lines) if len(lines) > 1 else "No posters saved yet. Tap Add Anime Poster to add one."
+    return "\n".join(lines) if len(lines) > 1 else "No templates saved yet. Tap Create Template to add one."
 
 
 async def _ongoing_buttons_summary():
@@ -968,34 +968,7 @@ async def handle_admin_session_input(client: Client, message: Message):
             await _clear_admin_state(user.id)
             await message.reply_text(text, reply_markup=_admin_main_keyboard())
 
-        elif stage == "oc_add_forward":
-            source_chat = getattr(message, "forward_from_chat", None)
-            # Newer Pyrogram versions may expose the original source through forward_origin.
-            origin = getattr(message, "forward_origin", None)
-            if not source_chat and origin:
-                source_chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
-            if not source_chat or getattr(source_chat, "type", None) not in {enums.ChatType.CHANNEL, "channel"}:
-                raise ValueError("Please forward a message directly from the ongoing channel. Do not copy/paste it. Make sure the bot is already an admin there.")
-            chat_id = int(source_chat.id)
-            await _validate_post_rights(client, chat_id)
-            doc = await _ensure_ongoing_channel_seed()
-            channels = list(doc.get("channels") or [])
-            if any(str(item.get("chat_id")) == str(chat_id) for item in channels):
-                raise ValueError("This ongoing channel is already saved.")
-            if len(channels) >= MAX_ONGOING_CHANNELS:
-                raise ValueError(f"All {MAX_ONGOING_CHANNELS} ongoing-channel slots are used. Remove one before adding another.")
-            username = getattr(source_chat, "username", None)
-            target = "@" + username if username else chat_id
-            channels.append({"chat_id": target, "title": getattr(source_chat, "title", None) or str(target), "mode": "public" if username else "private", "active": True})
-            await codeflixbots.codeflixbots[ONGOING_CHANNELS_COLLECTION].update_one({"_id": "global"}, {"$set": {"channels": channels, "updated_at": _now_utc()}})
-            await _clear_admin_state(user.id)
-            await message.reply_text(
-                f"✅ Ongoing channel added!\nChannel: {getattr(source_chat, 'title', None) or target}\nChannel ID: `{chat_id}`\nSaved channels: {len(channels)}/{MAX_ONGOING_CHANNELS}.",
-                reply_markup=_admin_main_keyboard(),
-            )
-
         elif stage == "oc_add":
-            # Legacy state compatibility for users who started adding a channel before this update.
             raw_channel = (message.text or "").strip()
             info = await _resolve_channel(client, raw_channel)
             if not info:
@@ -1004,7 +977,7 @@ async def handle_admin_session_input(client: Client, message: Message):
             doc = await _ensure_ongoing_channel_seed()
             channels = list(doc.get("channels") or [])
             if len(channels) >= MAX_ONGOING_CHANNELS:
-                raise ValueError(f"All {MAX_ONGOING_CHANNELS} ongoing-channel slots are used. Remove one before adding another.")
+                raise ValueError("All six ongoing-channel slots are used. Remove one before adding another.")
             channels.append({"chat_id": info["target"], "title": info["title"], "mode": "public" if isinstance(info["target"], str) else "private", "active": True})
             await codeflixbots.codeflixbots[ONGOING_CHANNELS_COLLECTION].update_one({"_id": "global"}, {"$set": {"channels": channels, "updated_at": _now_utc()}})
             await _clear_admin_state(user.id)
@@ -1186,7 +1159,7 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             "Send the complete ongoing-button template, one button per line.\n\n"
             "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
             "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1\n\n"
-            "Use #b, #r, or #g as style markers. {anime_invite} is replaced with the matching anime's saved invite link (prefer a link named Download, otherwise the first saved link). If no invite is saved, that button is skipped. Quality buttons are not added to ongoing posts. This template is shared by all ongoing channels."
+            "Use #b for blue, #r for red, #g for green. {anime_invite} is replaced with the invite link saved for whichever anime is being posted. This template is shared by all ongoing channels."
         )
     elif action == "main_ongoing_text":
         await _prompt(client, user.id, "main_ongoing_text", "Send the shared Main Ongoing Post Text. This text is used for every anime; placeholders such as {title}, {season}, {episode_range}, {status}, and {qualities} are replaced automatically.")
@@ -1199,41 +1172,7 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
     elif action == "set_ongoing_details":
         await _prompt(client, user.id, "set_ongoing_details", "Send: Anime | Season | Episode Range | Tag | Status | Qualities")
     elif action == "oc_add":
-        doc = await _ensure_ongoing_channel_seed()
-        channels = list(doc.get("channels") or [])
-        if len(channels) >= MAX_ONGOING_CHANNELS:
-            await client.send_message(user.id, f"All {MAX_ONGOING_CHANNELS} ongoing-channel slots are used. Remove one before adding another.", reply_markup=_menu_keyboard("ongoing_channels"))
-        else:
-            await _prompt(
-                client, user.id, "oc_add_forward",
-                "📡 **Add Ongoing Channel**\n\n"
-                "1. Add this bot as an administrator in the channel and allow it to post messages.\n"
-                "2. Forward any original message from that channel directly to this bot.\n"
-                "3. I'll verify the channel and save it automatically.\n\n"
-                "Do not copy/paste the message. Send /cancel to stop."
-            )
-    elif action == "oc_clear_all":
-        confirm_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, Clear All Ongoing Channels", callback_data="adm:oc_clear_confirm"),
-             InlineKeyboardButton("❌ Cancel", callback_data="adm:ongoing_channels")]
-        ])
-        warning = ("⚠️ **Clear ALL Saved Ongoing Channels?**\n\n"
-                   "This removes every channel from the shared ongoing-channel list. Anime invite links, anime channel assignments, and ongoing-button templates will remain unchanged. This cannot be undone.")
-        try:
-            await query.message.edit_text(warning, reply_markup=confirm_keyboard)
-        except Exception:
-            await client.send_message(user.id, warning, reply_markup=confirm_keyboard)
-    elif action == "oc_clear_confirm":
-        doc = await _ensure_ongoing_channel_seed()
-        count = len(doc.get("channels") or [])
-        await codeflixbots.codeflixbots[ONGOING_CHANNELS_COLLECTION].update_one(
-            {"_id": "global"}, {"$set": {"channels": [], "updated_at": _now_utc()}}
-        )
-        message_text = f"✅ Cleared all saved ongoing channels. Channels removed: {count}."
-        try:
-            await query.message.edit_text(message_text, reply_markup=_menu_keyboard("ongoing_channels"))
-        except Exception:
-            await client.send_message(user.id, message_text, reply_markup=_menu_keyboard("ongoing_channels"))
+        await _prompt(client, user.id, "oc_add", "Send a channel ID or @username. The bot must be an admin with posting rights. Maximum 6 ongoing channels.")
     elif action == "oc_edit":
         await _prompt(client, user.id, "oc_edit", "Send: Slot Number | Replacement Channel ID or @username")
     elif action == "oc_remove":

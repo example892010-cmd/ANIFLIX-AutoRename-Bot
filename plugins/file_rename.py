@@ -31,6 +31,7 @@ from helper.file_names import (
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
 from plugins.episode_publisher import store_file_and_process
+from plugins.ongoing_posts import _targets_with_global_fallback as _resolve_ongoing_targets
 
 logger = logging.getLogger(__name__)
 
@@ -459,9 +460,7 @@ async def _complete_manual_batch(client: Client, task: dict, status_message):
     route_key = task.get("selected_route_key")
     selected_route = await codeflixbots.codeflixbots["anime_routes"].find_one({"title_key": route_key}) if route_key else None
     individual_target = (selected_route or {}).get("individual_channel")
-    ongoing_targets = (selected_route or {}).get("ongoing_channels") or (
-        [(selected_route or {}).get("ongoing_channel")] if (selected_route or {}).get("ongoing_channel") else []
-    )
+    ongoing_targets = await _resolve_ongoing_targets(selected_route or {}) if selected_route else []
     individual_done = bool(individual_target and published_targets.get(f"individual:{individual_target}"))
     ongoing_done = sum(1 for target in ongoing_targets if target and published_targets.get(f"ongoing:{target}"))
     links_ready = bool(published_batch and all((published_batch.get("files") or {}).get("q" + quality, {}).get("url") for quality in ("480p", "720p", "1080p")))
