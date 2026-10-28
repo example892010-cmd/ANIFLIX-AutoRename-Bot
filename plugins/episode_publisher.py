@@ -388,6 +388,22 @@ async def _publish_ready_batch_locked(client, batch: dict) -> str:
 
     individual_target = route.get("individual_channel")
     ongoing_targets = route.get("ongoing_channels") or ([route.get("ongoing_channel")] if route.get("ongoing_channel") else [])
+
+    # The admin panel also supports a shared/global list of ongoing channels.
+    # Anime-channel forward setup saves only the individual channel, so use the
+    # configured global ongoing destinations when this anime has no per-anime list.
+    if not ongoing_targets:
+        try:
+            global_ongoing = await codeflixbots.codeflixbots["ongoing_channel_settings"].find_one({"_id": "global"}) or {}
+            for channel in global_ongoing.get("channels") or []:
+                if not isinstance(channel, dict) or channel.get("active", True) is False:
+                    continue
+                candidate = channel.get("chat_id") or channel.get("target") or channel.get("username")
+                if candidate:
+                    ongoing_targets.append(candidate)
+        except Exception:
+            logger.exception("Could not load the shared ongoing-channel list")
+
     # Preserve order and avoid sending twice if the same channel was assigned in both fields.
     unique_ongoing = []
     seen_ongoing = set()
