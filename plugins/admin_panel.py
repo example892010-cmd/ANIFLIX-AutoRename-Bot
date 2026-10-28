@@ -294,6 +294,21 @@ def _parse_targets(raw: str) -> list[str | int]:
     return result
 
 
+def _forwarded_channel_from_message(message):
+    """Return the channel a message was forwarded from, across Pyrogram versions."""
+    source_chat = getattr(message, "forward_from_chat", None)
+    if source_chat is not None:
+        return source_chat
+
+    # Some Telegram client/API versions expose a MessageOrigin* object instead.
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        source_chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        if source_chat is not None:
+            return source_chat
+    return None
+
+
 async def _resolve_channel(client, raw: str):
     value = (raw or "").strip()
     if not value or value == "-":
@@ -480,7 +495,7 @@ async def _ongoing_channels_text():
     lines = [f"📡 Ongoing Channels ({len(channels)}/{MAX_ONGOING_CHANNELS})"]
     for index, channel in enumerate(channels, start=1):
         lines.append(f"{index}. {channel.get('title') or channel.get('chat_id')} — {channel.get('chat_id')}")
-    lines.append("\nAssign one or more of these IDs in Anime Channels. The bot must be admin in every channel it posts to.")
+    lines.append("\nThese channels are used automatically for ongoing posts when an anime has no specific ongoing destinations assigned. Anime-specific assignments take priority. The bot must be admin in every channel it posts to.")
     return "\n".join(lines)
 
 
@@ -968,7 +983,64 @@ async def handle_admin_session_input(client: Client, message: Message):
             await _clear_admin_state(user.id)
             await message.reply_text(text, reply_markup=_admin_main_keyboard())
 
+        elif stage == "oc_add_forward":
+            source_chat = _forwarded_channel_from_message(message)
+            source_type = getattr(source_chat, "type", None) if source_chat is not None else None
+            source_type = str(getattr(source_type, "value", source_type)).casefold().split(".")[-1]
+            if source_chat is None or source_type != "channel":
+                raise ValueError(
+                    "Please forward an original message directly from the Telegram channel. "
+                    "Do not copy/paste it. Make sure this bot is already an admin there."
+                )
+
+            chat_id = int(source_chat.id)
+            await _validate_post_rights(client, chat_id)
+
+            doc = await _ensure_ongoing_channel_seed()
+            channels = list(doc.get("channels") or [])
+            username = getattr(source_chat, "username", None)
+            target = "@" + username if username else chat_id
+            matching_index = next((
+                index for index, item in enumerate(channels)
+                if str(item.get("chat_id")) == str(chat_id)
+                or (username and str(item.get("chat_id") or "").casefold() == ("@" + username).casefold())
+            ), None)
+            channel_title = getattr(source_chat, "title", None) or str(target)
+            saved_channel = {
+                "chat_id": target,
+                "title": channel_title,
+                "mode": "public" if username else "private",
+                "active": True,
+            }
+
+            if matching_index is not None:
+                # Default seeded entries may have only a generic title. Forwarding
+                # their channel message refreshes that entry instead of duplicating it.
+                channels[matching_index] = saved_channel
+                result_text = "✅ Ongoing channel details refreshed"
+            else:
+                if len(channels) >= MAX_ONGOING_CHANNELS:
+                    raise ValueError(
+                        f"All {MAX_ONGOING_CHANNELS} ongoing-channel slots are used. "
+                        "Remove one before adding another."
+                    )
+                channels.append(saved_channel)
+                result_text = "✅ Ongoing channel added"
+
+            await codeflixbots.codeflixbots[ONGOING_CHANNELS_COLLECTION].update_one(
+                {"_id": "global"},
+                {"$set": {"channels": channels, "updated_at": _now_utc()}},
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text(
+                f"{result_text}: **{channel_title}**\n"
+                f"Channel ID: `{chat_id}`\n"
+                f"Saved channels: {len(channels)}/{MAX_ONGOING_CHANNELS}.",
+                reply_markup=_admin_main_keyboard(),
+            )
+
         elif stage == "oc_add":
+            # Legacy text-based state compatibility for already-open admin sessions.
             raw_channel = (message.text or "").strip()
             info = await _resolve_channel(client, raw_channel)
             if not info:
@@ -1172,7 +1244,16 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
     elif action == "set_ongoing_details":
         await _prompt(client, user.id, "set_ongoing_details", "Send: Anime | Season | Episode Range | Tag | Status | Qualities")
     elif action == "oc_add":
-        await _prompt(client, user.id, "oc_add", "Send a channel ID or @username. The bot must be an admin with posting rights. Maximum 6 ongoing channels.")
+        await _prompt(
+            client,
+            user.id,
+            "oc_add_forward",
+            "📡 **Add Ongoing Channel**\n\n"
+            "1. Add this bot as an administrator in the channel and allow it to post messages.\n"
+            "2. Forward any original message from that channel directly to this bot.\n"
+            "3. The bot will detect and save the channel automatically.\n\n"
+            "Do not copy/paste the message. If the channel is already in the list, its saved title/details will be refreshed. Send /cancel to cancel.",
+        )
     elif action == "oc_edit":
         await _prompt(client, user.id, "oc_edit", "Send: Slot Number | Replacement Channel ID or @username")
     elif action == "oc_remove":
