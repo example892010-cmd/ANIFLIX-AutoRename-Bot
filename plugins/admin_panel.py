@@ -316,18 +316,36 @@ def _parse_targets(raw: str) -> list[str | int]:
 
 
 def _forwarded_channel_from_message(message):
-    """Return the channel a message was forwarded from, across Pyrogram versions."""
+    """Return original channel metadata from a forwarded message.
+
+    Pyrogram 2 uses forward_from_chat. Newer Bot API wrappers may expose
+    forward_origin; support both instead of accepting a copied/pasted message.
+    """
     source_chat = getattr(message, "forward_from_chat", None)
     if source_chat is not None:
         return source_chat
 
-    # Some Telegram client/API versions expose a MessageOrigin* object instead.
     origin = getattr(message, "forward_origin", None)
     if origin is not None:
         source_chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
         if source_chat is not None:
             return source_chat
-    return None
+
+    # A few client wrappers expose sender_chat directly for channel-origin posts.
+    return getattr(message, "sender_chat", None)
+
+
+def _normalize_fsub_invite_url(raw_url: str) -> str:
+    """Validate and canonicalize a Telegram channel invite/public link."""
+    raw_url = (raw_url or "").strip()
+    parsed = urlparse(raw_url)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme != "https" or host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+        raise ValueError("Send a valid https://t.me/ invite URL. A normal or join-request invite link is accepted.")
+    if not parsed.path or parsed.path == "/":
+        raise ValueError("The Telegram invite URL is incomplete. Send the full invite link.")
+    # Use one canonical host so the Join button always renders in the FSub prompt.
+    return "https://t.me/" + parsed.path.lstrip("/") + (("?" + parsed.query) if parsed.query else "") + (("#" + parsed.fragment) if parsed.fragment else "")
 
 
 def _forwarded_channel_message_id(message):
@@ -1423,11 +1441,13 @@ async def handle_admin_session_input(client: Client, message: Message):
 
         elif stage == "fsub_add_link":
             raw_text = (message.text or message.caption or "").strip()
+            # Accept just the link, but tolerate a label before a pipe as well.
             parts = [part.strip() for part in raw_text.split("|", 1)]
-            join_url = parts[0] if parts else ""
-            parsed = urlparse(join_url)
-            if parsed.scheme != "https" or parsed.netloc.lower() not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
-                raise ValueError("Send a valid https://t.me/ invite URL. A normal or join-request invite link is accepted.")
+            if len(parts) == 1:
+                candidate = parts[0]
+            else:
+                candidate = parts[0] if parts[0].startswith("https://") else parts[-1]
+            join_url = _normalize_fsub_invite_url(candidate)
             await _set_admin_state(user.id, "fsub_add_mode", {**data, "join_url": join_url})
             await message.reply_text(
                 "Choose the type of invite link you sent:",

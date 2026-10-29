@@ -54,6 +54,45 @@ class RequestedUpdateTests(unittest.TestCase):
         self.assertIn('stage == "fsub_add_link"', panel)
         self.assertIn('action.startswith("fsub_mode:")', panel)
 
+
+    def test_force_sub_membership_status_helpers_are_fail_safe(self):
+        source = (ROOT / "plugins" / "force_subs.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"_member_status", "_member_is_missing"}
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+        namespace = {}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "plugins/force_subs.py", "exec"), namespace)
+
+        class Member:
+            def __init__(self, status, is_member=False):
+                self.status = status
+                self.is_member = is_member
+
+        self.assertTrue(namespace["_member_is_missing"](Member("left")))
+        self.assertTrue(namespace["_member_is_missing"](Member("kicked")))
+        self.assertTrue(namespace["_member_is_missing"](Member("restricted", False)))
+        self.assertFalse(namespace["_member_is_missing"](Member("restricted", True)))
+        self.assertEqual(namespace["_member_status"](Member("administrator")), "administrator")
+
+    def test_force_sub_invite_url_is_normalized_for_join_button(self):
+        source = (ROOT / "plugins" / "admin_panel.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_normalize_fsub_invite_url")
+        from urllib.parse import urlparse
+        namespace = {"urlparse": urlparse}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "plugins/admin_panel.py", "exec"), namespace)
+        normalize = namespace["_normalize_fsub_invite_url"]
+        self.assertEqual(normalize("https://www.t.me/+abc123"), "https://t.me/+abc123")
+        self.assertEqual(normalize("https://telegram.me/joinchat/abc123"), "https://t.me/joinchat/abc123")
+        with self.assertRaises(ValueError):
+            normalize("https://example.com/not-an-invite")
+
+    def test_file_delivery_runs_force_sub_check_before_lookup(self):
+        source = (ROOT / "plugins" / "start_cb.py").read_text(encoding="utf-8")
+        handler = source[source.index("async def _deliver_file_token"):source.index('@Client.on_message(filters.private & filters.command("start"))')]
+        self.assertIn("check_fsub_membership(client, user_id)", handler)
+        self.assertLess(handler.index("check_fsub_membership(client, user_id)"), handler.index('"file_store"'))
+
     def test_stored_files_and_link_replacement_are_wired(self):
         panel = (ROOT / "plugins" / "admin_panel.py").read_text(encoding="utf-8")
         self.assertIn('callback_data="adm:stored_files"', panel)
@@ -69,3 +108,14 @@ class RequestedUpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_reupload_published_episode_allows_republish():
+    """Previously published batches must be reusable when an admin re-uploads a quality."""
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "plugins" / "episode_publisher.py").read_text()
+    assert 'return exact, "republish"' in source
+    assert 'return published[0][1], "republish"' in source
+    assert '"published_targets": {}} if republishing else {}' in source
+    assert "duplicate {quality} was not published again" not in source

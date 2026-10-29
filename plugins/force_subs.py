@@ -45,9 +45,13 @@ async def save_fsub_settings(settings: dict[str, Any]) -> None:
     )
 
 
-def _member_is_missing(member) -> bool:
+def _member_status(member) -> str:
     status = getattr(member, "status", "")
-    status = str(getattr(status, "value", status)).casefold().split(".")[-1]
+    return str(getattr(status, "value", status)).casefold().split(".")[-1]
+
+
+def _member_is_missing(member) -> bool:
+    status = _member_status(member)
     if status in {"left", "kicked", "banned"}:
         return True
     if status == "restricted" and not bool(getattr(member, "is_member", False)):
@@ -69,8 +73,13 @@ async def check_fsub_membership(client, user_id: int) -> tuple[list[dict[str, An
             continue
         try:
             member = await client.get_chat_member(target, int(user_id))
+            status = _member_status(member)
             if _member_is_missing(member):
                 missing.append(channel)
+            elif status not in {"member", "administrator", "creator", "owner", "restricted"}:
+                # Never silently allow access when Telegram returns an unexpected
+                # membership status; the file-delivery handler fails closed on errors.
+                errors.append(f"Channel {channel.get('title') or target}: Unknown membership status")
         except UserNotParticipant:
             missing.append(channel)
         except Exception as exc:
@@ -89,7 +98,11 @@ def subscription_keyboard(channels: list[dict[str, Any]], token: str) -> InlineK
                 url = "https://t.me/" + username[1:]
             elif not username.lstrip("-").isdigit() and username:
                 url = "https://t.me/" + username
-        if url.startswith(("https://t.me/", "http://t.me/")):
+        # Normalize accepted Telegram invite hosts so every saved valid link
+        # actually appears as a Join button.
+        if url.startswith(("https://t.me/", "http://t.me/", "https://www.t.me/", "https://telegram.me/", "https://www.telegram.me/")):
+            if url.startswith(("https://www.t.me/", "https://telegram.me/", "https://www.telegram.me/", "http://t.me/")):
+                url = "https://t.me/" + url.split("/", 3)[-1]
             label = str(channel.get("title") or f"Channel {index}")[:50]
             rows.append([InlineKeyboardButton(f"📢 Join {label}", url=url)])
     rows.append([InlineKeyboardButton("♻️ Try Again", callback_data=f"check_file_sub:{token}")])

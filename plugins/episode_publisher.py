@@ -578,7 +578,9 @@ async def _find_or_merge_episode_batch(batches, group_id: str, title: str,
     """
     exact = await batches.find_one({"_id": group_id})
     if exact and exact.get("state") == "published":
-        return exact, "published"
+        # An admin may intentionally upload the same episode/quality again.
+        # Reuse its batch, but allow a fresh publication instead of suppressing it.
+        return exact, "republish"
 
     cursor = batches.find({
         "season": str(season),
@@ -600,13 +602,14 @@ async def _find_or_merge_episode_batch(batches, group_id: str, title: str,
         if score >= 0.92 or candidate_id == str(group_id):
             matches.append((score, candidate))
 
-    # If a matching episode was already published under a previous title variant,
-    # preserve duplicate protection rather than creating a second episode post.
+    # Reuse a matching published batch so the new upload can refresh its quality
+    # slot and intentionally publish the episode again. Do not treat prior
+    # publication as a permanent duplicate lock.
     published = [(score, candidate) for score, candidate in matches
                  if candidate.get("state") == "published"]
     if published:
         published.sort(key=lambda item: item[0], reverse=True)
-        return published[0][1], "published"
+        return published[0][1], "republish"
 
     pending = [(score, candidate) for score, candidate in matches
                if candidate.get("state") not in {"published", "merged"}]
@@ -833,8 +836,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
         str(season),
         str(episode),
     )
-    if match_status == "published" or (existing and existing.get("state") == "published"):
-        return f"✅ File saved. This episode has already been published; duplicate {quality} was not published again."
+    republishing = match_status == "republish" or bool(existing and existing.get("state") == "published")
     if existing:
         group_id = str(existing["_id"])
         # Keep the main batch's saved title key for its route and verification history.
@@ -858,6 +860,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
                 "state": "collecting",
                 "updated_at": created_at,
                 "last_error": None,
+                **({"published_targets": {}} if republishing else {}),
                 **({"route_title_key": details.get("route_title_key")} if details and details.get("route_title_key") else {}),
             },
         },

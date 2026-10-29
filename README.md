@@ -15,7 +15,7 @@ A Pyrogram-based Telegram file renamer with per-user filename templates, optiona
 - Completed episode groups are stored in the dump channel, verified, and automatically published to the anime's individual channel with 480p / 720p / 1080p quality buttons.
 - `/ongoing Anime Title` publishes the saved ongoing template and poster with the anime's saved invite-link buttons to its configured ongoing channels.
 - `/admin` provides inline-button menus for Anime Channels, Anime Invite Links (add/edit/remove/view), Episode Manager, Link Verification, Post Customization, Anime Post, Ongoing Post, Ongoing Details, Ongoing Channels, Force Subscribe, and Bot Settings.
-- Force Subscribe supports up to six channels, independently configured with normal join or join-request invite links. A member's file delivery is allowed only after all configured channel memberships are verified.
+- Force Subscribe supports up to seven channels. In Admin Panel → Force Subscribe → Add Channel, add the bot as an administrator, forward an original post from that channel, send its invite URL, and choose normal join or join-request. File deep links check every configured channel before delivering media; unjoined users receive Join buttons and a Try Again button. Admin IDs bypass the gate, so test with a non-admin Telegram account.
 - Non-admins can only use saved `file_...` deep links to retrieve files; rename commands and other bot features are admin-only.
 
 ## Required environment variables

@@ -1,0 +1,15 @@
+ANIFLIX AUTO-RENAME BOT — COMBINED UPDATE
+
+Included changes:
+1. Existing Anime Post link replacement: forward an exact bot-published Anime Post, then send a new URL; all three quality-button URLs are updated while the post caption/labels/layout are preserved. Ongoing posts are not edited.
+2. /batch1–/batch5 accept long/multiline anime titles, an episode range such as 01 -14, and episode numbers up to 6 digits (for example 15, 590, 1000). Leading zeroes are retained for the post display.
+3. Admin Panel → Stored Files shows the count and paginated stored-file access links, with Clear All Links confirmation.
+4. Force Subscribe Add now asks for an original forwarded channel message, verifies that the bot is an administrator, asks for the invite URL, and lets the admin choose normal join or join-request link. Limit: 7 channels.
+5. Ongoing poster lookup has extra title-key fallbacks to help find saved Template Set posters.
+
+Checks completed locally:
+- Python syntax compilation of all project plugin/helper/test files.
+- 16 unittest tests passed, including the pre-existing filename suite and new regression checks.
+
+Important verification limit:
+These checks are offline. The real Telegram workflow (bot admin permissions, MongoDB data, posting, button editing, and force-sub membership checks) still needs a live test after deployment. Clear All Links deletes saved access-link records and makes existing bot download links unusable; it does not delete media from the Telegram storage channel.
