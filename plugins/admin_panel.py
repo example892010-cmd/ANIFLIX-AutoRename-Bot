@@ -4,6 +4,7 @@ from pyrogram.types import Message
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
 import os, sys, time, asyncio, logging, datetime
+import aiohttp
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
@@ -129,7 +130,7 @@ TEMPLATES_COLLECTION = "anime_templates"
 POST_TEMPLATES_COLLECTION = "post_template_settings"
 FSUB_COLLECTION = "fsub_settings"
 MAX_ONGOING_CHANNELS = 6
-MAX_FSUB_CHANNELS = 6
+MAX_FSUB_CHANNELS = 7
 DEFAULT_ONGOING_BUTTONS_TEMPLATE = (
     "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
     "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1"
@@ -186,6 +187,7 @@ def _admin_main_keyboard():
         [InlineKeyboardButton("📚 Templates", callback_data="adm:templates"), InlineKeyboardButton("📝 Post Text", callback_data="adm:post_customization")],
         [InlineKeyboardButton("🎬 Anime Buttons", callback_data="adm:anime_buttons"), InlineKeyboardButton("🔘 Ongoing Buttons", callback_data="adm:ongoing_buttons")],
         [InlineKeyboardButton("📡 Ongoing Channels", callback_data="adm:ongoing_channels"), InlineKeyboardButton("🔒 Force Subscribe", callback_data="adm:fsub")],
+        [InlineKeyboardButton("📦 Stored Files", callback_data="adm:stored_files")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings")],
         [InlineKeyboardButton("🚀 Publish Ongoing", callback_data="adm:publish_ongoing")],
     ])
@@ -326,6 +328,148 @@ def _forwarded_channel_from_message(message):
         if source_chat is not None:
             return source_chat
     return None
+
+
+def _forwarded_channel_message_id(message):
+    """Return the original message ID from a channel forward, across Pyrogram versions."""
+    value = getattr(message, "forward_from_message_id", None)
+    origin = getattr(message, "forward_origin", None)
+    if value is None and origin is not None:
+        value = getattr(origin, "message_id", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _flatten_inline_keyboard(markup):
+    """Return (row_index, button) pairs from a Telegram inline keyboard."""
+    keyboard = getattr(markup, "inline_keyboard", None) if markup is not None else None
+    flattened = []
+    for row_index, row in enumerate(keyboard or []):
+        for button in row or []:
+            flattened.append((row_index, button))
+    return flattened
+
+
+def _saved_anime_button_styles(template: str) -> list[str]:
+    """Read the current three Anime Buttons style codes in display order."""
+    styles = []
+    style_map = {"b": "primary", "r": "danger", "g": "success"}
+    for line in (line.strip() for line in (template or "").splitlines() if line.strip()):
+        for item in line.split(" | "):
+            match = re.match(r"^#([bgr])\s+(.+?)\s+-\s*(.*?)\s*$", item.strip(), re.IGNORECASE)
+            if match:
+                styles.append(style_map[match.group(1).lower()])
+    return styles
+
+
+async def _find_recorded_anime_post(chat_id: int, message_id: int, username: str | None = None):
+    """Confirm a forwarded message belongs to a saved Anime Post route and bot publish record."""
+    route_collection = _route_collection()
+    candidates = [int(chat_id), str(int(chat_id))]
+    if username:
+        candidates.extend(["@" + username.lstrip("@"), username.lstrip("@").casefold()])
+    route_cursor = route_collection.find({"individual_channel": {"$in": candidates}}).limit(25)
+    routes = await route_cursor.to_list(length=25)
+    if not routes:
+        return None, False
+
+    keys = []
+    for route in routes:
+        for key in (route.get("title_key"), _title_key(route.get("title") or "")):
+            if key and key not in keys:
+                keys.append(key)
+    if not keys:
+        return None, True
+
+    collection = codeflixbots.codeflixbots["episode_batches"]
+    cursor = collection.find({
+        "$or": [
+            {"route_title_key": {"$in": keys}},
+            {"title_key": {"$in": keys}},
+        ],
+        "published_targets": {"$exists": True},
+    }).sort("updated_at", -1).limit(500)
+    batches = await cursor.to_list(length=500)
+    for batch in batches:
+        for target_key, record in (batch.get("published_targets") or {}).items():
+            if not str(target_key).startswith("individual:") or not isinstance(record, dict):
+                continue
+            try:
+                same_chat = int(record.get("chat_id")) == int(chat_id)
+                same_message = int(record.get("message_id")) == int(message_id)
+            except (TypeError, ValueError):
+                continue
+            if same_chat and same_message:
+                route_key = batch.get("route_title_key") or batch.get("title_key")
+                route = next((item for item in routes if item.get("title_key") == route_key), routes[0])
+                return {"route": route, "batch": batch}, True
+    return None, True
+
+
+async def _edit_anime_post_button_urls(client, chat_id: int, message_id: int, buttons, new_url: str):
+    """Update only the URL of the three existing Anime Post buttons via Telegram Bot API."""
+    token = str(getattr(Config, "BOT_TOKEN", "") or "").strip()
+    if not token:
+        raise RuntimeError("BOT_TOKEN is not configured")
+
+    post_settings = await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].find_one({"_id": "global"}) or {}
+    styles = _saved_anime_button_styles(post_settings.get("anime_buttons_template") or DEFAULT_ANIME_BUTTONS_TEMPLATE)
+    row_lengths = []
+    keyboard_rows = []
+    flat_index = 0
+    for row_index, row in enumerate(getattr(buttons, "inline_keyboard", []) or []):
+        outgoing_row = []
+        for button in row or []:
+            label = str(getattr(button, "text", "") or "").strip()
+            if not label:
+                raise ValueError("The original post contains a button without a label; no changes were made.")
+            outgoing = {"text": label, "url": new_url}
+            style = styles[flat_index] if flat_index < len(styles) else None
+            # Pyrogram may not expose Bot API button styles. Reuse the saved template's
+            # color order when available; Telegram's fallback below handles older Bot APIs.
+            if style:
+                outgoing["style"] = style
+            outgoing_row.append(outgoing)
+            flat_index += 1
+        if outgoing_row:
+            row_lengths.append(len(outgoing_row))
+            keyboard_rows.append(outgoing_row)
+
+    if flat_index != 3 or sum(row_lengths) != 3:
+        raise ValueError("Only a bot-published Anime Post with exactly three inline buttons can be updated.")
+
+    endpoint = f"https://api.telegram.org/bot{token}/editMessageReplyMarkup"
+    timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=20)
+    styled = True
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(2):
+            outgoing_keyboard = keyboard_rows
+            if not styled:
+                outgoing_keyboard = [
+                    [{"text": item["text"], "url": item["url"]} for item in row]
+                    for row in keyboard_rows
+                ]
+            payload = {
+                "chat_id": int(chat_id),
+                "message_id": int(message_id),
+                "reply_markup": {"inline_keyboard": outgoing_keyboard},
+            }
+            async with session.post(endpoint, json=payload) as response:
+                result = await response.json(content_type=None)
+            if result.get("ok"):
+                return
+            description = str(result.get("description") or "Telegram rejected the button update")
+            folded = description.casefold()
+            if styled and ("style" in folded or "keyboardbuttonstyle" in folded or "inlinekeyboardbutton" in folded):
+                styled = False
+                logger.warning("Telegram rejected styled Anime Post buttons; retrying without style fields: %s", description)
+                continue
+            if "message is not modified" in folded:
+                return
+            raise RuntimeError(description)
+    raise RuntimeError("Telegram did not accept the Anime Post button update")
 
 
 async def _resolve_channel(client, raw: str):
@@ -502,7 +646,7 @@ async def _fsub_text():
     for index, channel in enumerate(settings.get("channels") or [], start=1):
         lines.append(
             f"{index}. {channel.get('title') or channel.get('chat_id')}\n"
-            f"   ID: {channel.get('chat_id')} | Mode: {channel.get('mode', 'normal')}\n"
+            f"   ID: {channel.get('chat_id')} | Mode: {'Join Request' if channel.get('mode') == 'join_request' else 'Normal Join'}\n"
             f"   Join link: {channel.get('join_url') or 'Not set'}"
         )
     return "\n".join(lines)
@@ -564,6 +708,43 @@ async def _anime_buttons_summary():
     )
 
 
+STORED_FILES_PAGE_SIZE = 8
+
+
+def _stored_files_keyboard(page: int, total_pages: int):
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"adm:stored_files_page:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"adm:stored_files_page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🗑️ Clear All Links", callback_data="adm:stored_files_clear")])
+    rows.append([InlineKeyboardButton("⬅️ Admin Home", callback_data="adm:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _stored_files_page_text(page: int = 0):
+    collection = codeflixbots.codeflixbots["file_store"]
+    total = await collection.count_documents({})
+    total_pages = max(1, (total + STORED_FILES_PAGE_SIZE - 1) // STORED_FILES_PAGE_SIZE)
+    page = min(max(0, int(page)), total_pages - 1)
+    cursor = collection.find({}).sort("created_at", -1).skip(page * STORED_FILES_PAGE_SIZE).limit(STORED_FILES_PAGE_SIZE)
+    items = await cursor.to_list(length=STORED_FILES_PAGE_SIZE)
+    lines = [f"📦 STORED FILES\nTotal stored file records: {total}\nPage {page + 1}/{total_pages}\n"]
+    if not items:
+        lines.append("No stored file records or access links are saved yet.")
+    for index, item in enumerate(items, start=page * STORED_FILES_PAGE_SIZE + 1):
+        title = item.get("title") or "Unknown anime"
+        filename = item.get("filename") or "(filename unavailable)"
+        quality = item.get("quality") or "Unknown quality"
+        url = item.get("url") or "Link not generated yet"
+        lines.append(f"{index}. {title} — {quality}\n   {filename}\n   {url}")
+    lines.append("\nClear All Links removes saved access-link records. Files already in your Telegram storage channel are not deleted.")
+    return "\n\n".join(lines)[:3900], _stored_files_keyboard(page, total_pages)
+
+
 @Client.on_message(filters.private & filters.command("admin"))
 async def admin_dashboard(client: Client, message: Message):
     if not is_admin_user(getattr(message, "from_user", None)):
@@ -595,6 +776,59 @@ async def handle_admin_session_input(client: Client, message: Message):
         logger.exception("Could not load admin UI state")
         return
     if not session or not session.get("stage"):
+        # A forwarded, already-published Anime Post can start the one-link replacement
+        # flow. The DB publish record is required: arbitrary channel posts and ongoing
+        # posts are never edited by this feature.
+        source_chat = _forwarded_channel_from_message(message)
+        source_message_id = _forwarded_channel_message_id(message)
+        source_type = getattr(source_chat, "type", None) if source_chat is not None else None
+        source_type = str(getattr(source_type, "value", source_type)).casefold().split(".")[-1]
+        if source_chat is None or source_type != "channel" or source_message_id is None:
+            return
+        try:
+            chat_id = int(source_chat.id)
+            match, is_anime_channel = await _find_recorded_anime_post(
+                chat_id, source_message_id, getattr(source_chat, "username", None)
+            )
+            if match is None:
+                if is_anime_channel:
+                    await message.reply_text(
+                        "❌ I found this saved Anime Post channel, but couldn't verify this exact message as a bot-published Anime Post. "
+                        "Forward the original post that this bot published. Ongoing-channel posts aren't supported here."
+                    )
+                    raise StopPropagation
+                return
+            original = await client.get_messages(chat_id, source_message_id)
+            markup = getattr(original, "reply_markup", None) if original else None
+            flattened = _flatten_inline_keyboard(markup)
+            if len(flattened) != 3 or any(not getattr(button, "url", None) for _, button in flattened):
+                await message.reply_text(
+                    "❌ This saved Anime Post doesn't have exactly three URL buttons. No changes were made. "
+                    "Please forward the bot-published Anime Post with the 480p, 720p, and 1080p buttons."
+                )
+                raise StopPropagation
+            route = match["route"]
+            data = {
+                "chat_id": chat_id,
+                "message_id": int(source_message_id),
+                "title": str(route.get("title") or match["batch"].get("title") or "Anime"),
+                "batch_id": str(match["batch"].get("_id") or ""),
+            }
+            await _set_admin_state(user.id, "anime_replace_button_link", data)
+            await message.reply_text(
+                f"✅ Verified bot-published Anime Post: {data['title']}\n"
+                f"Channel: {getattr(source_chat, 'title', None) or chat_id}\n\n"
+                "Send the new full URL. I will replace the link on all three existing inline buttons (480p, 720p, and 1080p) with this same URL. "
+                "Button names, row layout, and the saved Anime Buttons color order are preserved.\n\n"
+                "This works only for Anime Post channel messages, not ongoing posts. Send /cancel to cancel."
+            )
+            raise StopPropagation
+        except StopPropagation:
+            raise
+        except Exception as exc:
+            logger.exception("Could not start Anime Post button-link replacement flow")
+            await message.reply_text(f"❌ Could not inspect the forwarded post: {type(exc).__name__}: {exc}")
+            raise StopPropagation
         return
 
     if re.match(r"^/cancel(?:@\w+)?(?:\s|$)", (message.text or "").strip(), re.IGNORECASE):
@@ -894,6 +1128,33 @@ async def handle_admin_session_input(client: Client, message: Message):
                 reply_markup=_admin_main_keyboard(),
             )
 
+        elif stage == "anime_replace_button_link":
+            new_url = (message.text or message.caption or "").strip()
+            parsed_url = urlparse(new_url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+                raise ValueError("Send a complete http:// or https:// URL. All three Anime Post buttons will use this one link.")
+            try:
+                chat_id = int(data["chat_id"])
+                original_message_id = int(data["message_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                await _clear_admin_state(user.id)
+                raise ValueError("The saved post reference expired. Forward the bot-published Anime Post again.") from exc
+            # Re-validate the post reference before editing it, so a stale session cannot
+            # change a different message after a bot restart or overlapping admin action.
+            original = await client.get_messages(chat_id, original_message_id)
+            markup = getattr(original, "reply_markup", None) if original else None
+            flattened = _flatten_inline_keyboard(markup)
+            if not original or len(flattened) != 3 or any(not getattr(button, "url", None) for _, button in flattened):
+                raise ValueError("The original Anime Post no longer has exactly three URL buttons. No changes were made; forward it again.")
+            await _edit_anime_post_button_urls(client, chat_id, original_message_id, markup, new_url)
+            await _clear_admin_state(user.id)
+            await message.reply_text(
+                f"✅ Updated the Anime Post buttons for {data.get('title') or 'the selected anime'}.\n"
+                "All three quality buttons now use the same new link. The post caption, button labels, and ongoing-channel posts were not changed.",
+                reply_markup=_admin_main_keyboard(),
+                disable_web_page_preview=True,
+            )
+
         elif stage == "anime_buttons_template":
             template = (message.text or message.caption or "").strip()
             if not template:
@@ -1117,39 +1378,65 @@ async def handle_admin_session_input(client: Client, message: Message):
             result = await post_ongoing_anime(client, title)
             await message.reply_text(result, reply_markup=_admin_main_keyboard(), disable_web_page_preview=True)
 
-        elif stage == "fsub_add":
-            parts = [part.strip() for part in (message.text or "").split("|", 2)]
-            if len(parts) != 3:
-                raise ValueError("Use: Channel ID/@username | Join URL | normal or join_request")
-            raw_channel, join_url, mode = parts
-            mode = mode.casefold().replace("-", "_").replace(" ", "_")
-            if mode in {"joinrequest", "request"}:
-                mode = "join_request"
-            if mode not in {"normal", "join_request"}:
-                raise ValueError("Mode must be normal or join_request.")
-            parsed = urlparse(join_url)
-            if parsed.scheme != "https" or parsed.netloc.lower() not in {"t.me", "www.t.me"}:
-                raise ValueError("Join URL must be an https://t.me/... link.")
-            info = await _resolve_channel(client, raw_channel)
-            if not info:
-                raise ValueError("Enter a valid channel ID or @username.")
+        elif stage == "fsub_add_forward":
+            source_chat = _forwarded_channel_from_message(message)
+            source_type = getattr(source_chat, "type", None) if source_chat is not None else None
+            source_type = str(getattr(source_type, "value", source_type)).casefold().split(".")[-1]
+            if source_chat is None or source_type != "channel":
+                raise ValueError("Please forward an original message directly from the channel. Do not copy/paste it.")
+            chat_id = int(source_chat.id)
             try:
-                bot_member = await client.get_chat_member(info["chat_id"], (await client.get_me()).id)
-                bot_status = str(getattr(bot_member, "status", "")).casefold().split(".")[-1]
+                me = await client.get_me()
+                bot_member = await client.get_chat_member(chat_id, int(me.id))
+                bot_status = str(getattr(getattr(bot_member, "status", ""), "value", getattr(bot_member, "status", ""))).casefold().split(".")[-1]
                 if bot_status not in {"administrator", "creator", "owner"}:
-                    raise ValueError("The bot must be an administrator in this channel so Telegram membership checks work reliably.")
+                    raise ValueError("The bot must be an administrator in this channel so it can check membership. Add it as admin, then forward a message again.")
             except ValueError:
                 raise
             except Exception as exc:
-                raise ValueError("The bot must be an administrator of that channel and able to check members before FSub is saved.") from exc
+                raise ValueError("I could not verify the bot's admin status. Add the bot as admin in that channel, then forward a message again.") from exc
             settings = await get_fsub_settings()
-            channels = list(settings.get("channels") or [])
-            if len(channels) >= MAX_FSUB_CHANNELS:
-                raise ValueError("All 6 FSub slots are used. Remove one before adding another.")
-            channels.append({"chat_id": info["chat_id"], "title": info["title"], "join_url": join_url, "mode": mode})
-            await save_fsub_settings({"enabled": True, "channels": channels})
-            await _clear_admin_state(user.id)
-            await message.reply_text(f"✅ Force Subscribe channel added ({len(channels)}/{MAX_FSUB_CHANNELS}). Mode: {mode}.", reply_markup=_admin_main_keyboard())
+            existing = list(settings.get("channels") or [])
+            source_username = str(getattr(source_chat, "username", None) or "").lstrip("@").casefold()
+            already_saved = False
+            for item in existing:
+                saved_id = str(item.get("chat_id", "")).strip()
+                saved_username = str(item.get("username", "") or saved_id).lstrip("@").casefold()
+                if saved_id.lstrip("-").isdigit() and int(saved_id) == chat_id:
+                    already_saved = True
+                    break
+                if source_username and saved_username == source_username:
+                    already_saved = True
+                    break
+            if already_saved:
+                raise ValueError("This Force Subscribe channel is already saved.")
+            if len(existing) >= MAX_FSUB_CHANNELS:
+                await _clear_admin_state(user.id)
+                raise ValueError(f"All {MAX_FSUB_CHANNELS} Force Subscribe slots are occupied. Remove one first.")
+            title = getattr(source_chat, "title", None) or str(chat_id)
+            await _set_admin_state(user.id, "fsub_add_link", {"chat_id": chat_id, "title": title})
+            await message.reply_text(
+                f"✅ Channel detected: {title}\nChannel ID: {chat_id}\nBot admin verified.\n\n"
+                "Now send only the invite URL for this channel (normal join link or join-request link).",
+                parse_mode=enums.ParseMode.DISABLED,
+            )
+
+        elif stage == "fsub_add_link":
+            raw_text = (message.text or message.caption or "").strip()
+            parts = [part.strip() for part in raw_text.split("|", 1)]
+            join_url = parts[0] if parts else ""
+            parsed = urlparse(join_url)
+            if parsed.scheme != "https" or parsed.netloc.lower() not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+                raise ValueError("Send a valid https://t.me/ invite URL. A normal or join-request invite link is accepted.")
+            await _set_admin_state(user.id, "fsub_add_mode", {**data, "join_url": join_url})
+            await message.reply_text(
+                "Choose the type of invite link you sent:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Normal Join Link", callback_data="adm:fsub_mode:normal")],
+                    [InlineKeyboardButton("📨 Join-Request Link", callback_data="adm:fsub_mode:join_request")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="adm:fsub_mode:cancel")],
+                ]),
+            )
 
         elif stage == "fsub_edit_index":
             raw_index = (message.text or "").strip()
@@ -1449,6 +1736,49 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             await query.message.edit_text(warning, reply_markup=confirm_keyboard)
         except Exception:
             await client.send_message(user.id, warning, reply_markup=confirm_keyboard)
+    elif action == "stored_files" or action.startswith("stored_files_page:"):
+        page = 0
+        if action.startswith("stored_files_page:"):
+            raw_page = action.partition(":")[2]
+            try:
+                page = max(0, int(raw_page))
+            except ValueError:
+                page = 0
+        text, keyboard = await _stored_files_page_text(page)
+        try:
+            await query.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True, parse_mode=enums.ParseMode.DISABLED)
+        except Exception:
+            await client.send_message(user.id, text, reply_markup=keyboard, disable_web_page_preview=True, parse_mode=enums.ParseMode.DISABLED)
+    elif action == "stored_files_clear":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Clear All Links", callback_data="adm:stored_files_clear_confirm"),
+             InlineKeyboardButton("❌ Cancel", callback_data="adm:stored_files")]
+        ])
+        warning = (
+            "⚠️ **Clear All Stored File Links?**\n\n"
+            "This deletes saved access-link records and invalidates existing bot download links. "
+            "It does not delete the actual media from your Telegram storage channel. This cannot be undone."
+        )
+        try:
+            await query.message.edit_text(warning, reply_markup=keyboard)
+        except Exception:
+            await client.send_message(user.id, warning, reply_markup=keyboard)
+    elif action == "stored_files_clear_confirm":
+        result = await codeflixbots.codeflixbots["file_store"].delete_many({})
+        unset_fields = {}
+        for quality_key in ("q480p", "q720p", "q1080p"):
+            for field in ("url", "access_token", "storage_post_url"):
+                unset_fields[f"files.{quality_key}.{field}"] = ""
+        batches_result = await codeflixbots.codeflixbots["episode_batches"].update_many({}, {"$unset": unset_fields})
+        text = (
+            f"✅ Cleared stored-file access links.\nLink records removed: {result.deleted_count}.\n"
+            f"Episode records updated: {batches_result.modified_count}.\n\n"
+            "The actual files in the Telegram storage channel were not deleted. Existing published buttons will no longer deliver files."
+        )
+        try:
+            await query.message.edit_text(text, reply_markup=_stored_files_keyboard(0, 1))
+        except Exception:
+            await client.send_message(user.id, text, reply_markup=_stored_files_keyboard(0, 1))
     elif action == "invite_clear_confirm":
         result = await codeflixbots.codeflixbots[INVITES_COLLECTION].delete_many({})
         message_text = f"✅ Cleared all saved anime invite links. Anime records cleared: {result.deleted_count}."
@@ -1567,9 +1897,49 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
     elif action == "fsub_add":
         settings = await get_fsub_settings()
         if len(settings.get("channels") or []) >= MAX_FSUB_CHANNELS:
-            await client.send_message(user.id, "All 6 FSub slots are occupied. Remove one first.")
+            await client.send_message(user.id, f"All {MAX_FSUB_CHANNELS} Force Subscribe slots are occupied. Remove one first.")
         else:
-            await _prompt(client, user.id, "fsub_add", "Send: Channel ID/@username | Join URL | normal OR join_request\nFor a private channel use its numeric ID and its invite link.")
+            await _prompt(
+                client, user.id, "fsub_add_forward",
+                "🔒 **Add Force Subscribe Channel**\n\n"
+                "1. Add this bot as an administrator in the channel so it can check membership.\n"
+                "2. Forward any original message directly from that channel to this bot.\n"
+                "3. Then send the channel's invite link. You can use a normal join link or a join-request link.\n\n"
+                "For private channels, forward a post from the channel; do not send a copied message."
+            )
+    elif action.startswith("fsub_mode:"):
+        mode = action.partition(":")[2]
+        if mode == "cancel":
+            await _clear_admin_state(user.id)
+            await client.send_message(user.id, "✅ Force Subscribe channel addition cancelled.", reply_markup=_admin_main_keyboard())
+            return
+        if mode not in {"normal", "join_request"}:
+            await client.send_message(user.id, "Invalid link type. Start Add Channel again.")
+            return
+        session = await _get_admin_state(user.id)
+        if not session or session.get("stage") != "fsub_add_mode":
+            await client.send_message(user.id, "This Force Subscribe setup expired. Start Add Channel again.")
+            return
+        data = session.get("data") or {}
+        chat_id = int(data.get("chat_id"))
+        title = str(data.get("title") or chat_id)
+        join_url = str(data.get("join_url") or "").strip()
+        settings = await get_fsub_settings()
+        channels = list(settings.get("channels") or [])
+        if len(channels) >= MAX_FSUB_CHANNELS:
+            await _clear_admin_state(user.id)
+            await client.send_message(user.id, f"All {MAX_FSUB_CHANNELS} Force Subscribe slots are occupied. Remove one first.")
+            return
+        channels.append({"chat_id": chat_id, "title": title, "join_url": join_url, "mode": mode})
+        await save_fsub_settings({"enabled": True, "channels": channels})
+        await _clear_admin_state(user.id)
+        await client.send_message(
+            user.id,
+            f"✅ Force Subscribe channel added ({len(channels)}/{MAX_FSUB_CHANNELS}).\n"
+            f"Channel: {title}\nLink type: {'Join Request' if mode == 'join_request' else 'Normal Join'}\n"
+            "Membership verification is enabled for this channel.",
+            reply_markup=_admin_main_keyboard(),
+        )
     elif action == "fsub_edit":
         settings = await get_fsub_settings()
         channels = list(settings.get("channels") or [])
