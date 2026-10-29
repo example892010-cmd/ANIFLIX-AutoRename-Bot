@@ -150,21 +150,26 @@ def _parse_upload_details(text: str) -> dict | None:
         parts = [part.strip() for part in raw.split("|", 2)]
     else:
         parts = [part.strip() for part in raw.splitlines() if part.strip()]
-    if len(parts) != 3 or not parts[0]:
+    if len(parts) < 3:
         return None
-    title, raw_season, raw_episode = parts
+    # The last two non-empty lines are Season and Episode. Everything before them
+    # is the title, allowing long anime titles to be wrapped across multiple lines.
+    title_parts, raw_season, raw_episode = parts[:-2], parts[-2], parts[-1]
+    title = " ".join(part for part in title_parts if part).strip()
+    if not title:
+        return None
     season_match = re.search(r"(?i)\bseason\s*(\d{1,2})\b|^\s*(\d{1,2})\s*$", raw_season)
     if not season_match:
         return None
     season = season_match.group(1) or season_match.group(2)
-    episode_match = re.fullmatch(r"\s*(?:Episode\s*)?(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*", raw_episode, re.I)
+    episode_match = re.fullmatch(r"\s*(?:Episode\s*)?(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?\s*", raw_episode, re.I)
     if not episode_match:
         return None
-    first = str(int(episode_match.group(1)))
-    last = str(int(episode_match.group(2))) if episode_match.group(2) else None
+    first = episode_match.group(1)
+    last = episode_match.group(2) if episode_match.group(2) else None
     if last and int(last) < int(first):
         return None
-    episode_range = f"{first}-{last}" if last and last != first else first
+    episode_range = f"{first}-{last}" if last and int(last) != int(first) else first
     return {"title": title, "season": str(int(season)), "episode_range": episode_range}
 
 
@@ -251,8 +256,6 @@ def _parse_batch_command(message_text: str) -> tuple[int, dict] | None:
             "The anime title must exactly match a completed Template Set to select its channel automatically."
             " Use /batch2, /batch3, /batch4, or /batch5 for separate tasks."
         )
-    if "-" in details["episode_range"]:
-        raise ValueError("For a batch, send one episode number (for example, `4`), not an episode range.")
     return batch_number, details
 
 
@@ -558,7 +561,7 @@ async def _complete_manual_batch(client: Client, task: dict, status_message):
         season_value = str(int(season_value)) if season_value else ""
     except ValueError:
         pass
-    episode_match = re.fullmatch(r"\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*", episode_value)
+    episode_match = re.fullmatch(r"\s*(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?\s*", episode_value)
     if episode_match:
         first_episode = str(int(episode_match.group(1)))
         last_episode = str(int(episode_match.group(2))) if episode_match.group(2) else None
