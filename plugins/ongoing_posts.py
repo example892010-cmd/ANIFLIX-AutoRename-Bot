@@ -215,7 +215,15 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
 
     details = route.get("ongoing_details") or {}
     qualities = details.get("qualities") or "480p, 720p, 1080p"
-    saved_template = await codeflixbots.codeflixbots["anime_templates"].find_one({"_id": key}) or {}
+    templates_collection = codeflixbots.codeflixbots["anime_templates"]
+    saved_template = await templates_collection.find_one({"_id": key}) or {}
+    if not saved_template:
+        saved_template = await templates_collection.find_one({"title_key": key}) or {}
+    if not saved_template:
+        # Older saved sets may have a differently formatted _id but an exact title.
+        escaped_title = re.escape(str(title or "").strip())
+        if escaped_title:
+            saved_template = await templates_collection.find_one({"title": {"$regex": f"^{escaped_title}$", "$options": "i"}}) or {}
     values = {
         "anime": route.get("title") or title,
         "title": route.get("title") or title,
