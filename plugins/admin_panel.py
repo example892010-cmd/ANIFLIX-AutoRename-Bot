@@ -134,6 +134,9 @@ DEFAULT_ONGOING_BUTTONS_TEMPLATE = (
     "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n"
     "#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1"
 )
+DEFAULT_ANIME_BUTTONS_TEMPLATE = (
+    "#b 480P - {quality_480p} | #r 720P - {quality_720p} | #g 1080P - {quality_1080p}"
+)
 DEFAULT_ONGOING_CHANNEL_IDS = [
     -1003693662050,
     -1003528863118,
@@ -181,7 +184,7 @@ def _admin_main_keyboard():
         [InlineKeyboardButton("📺 Anime Channels", callback_data="adm:anime_channels"), InlineKeyboardButton("🔗 Anime Invite Links", callback_data="adm:invites")],
         [InlineKeyboardButton("🎬 Episode Manager", callback_data="adm:episode_manager"), InlineKeyboardButton("✅ Link Verification", callback_data="adm:verify_links")],
         [InlineKeyboardButton("📚 Templates", callback_data="adm:templates"), InlineKeyboardButton("📝 Post Text", callback_data="adm:post_customization")],
-        [InlineKeyboardButton("🔘 Ongoing Buttons", callback_data="adm:ongoing_buttons")],
+        [InlineKeyboardButton("🎬 Anime Buttons", callback_data="adm:anime_buttons"), InlineKeyboardButton("🔘 Ongoing Buttons", callback_data="adm:ongoing_buttons")],
         [InlineKeyboardButton("📡 Ongoing Channels", callback_data="adm:ongoing_channels"), InlineKeyboardButton("🔒 Force Subscribe", callback_data="adm:fsub")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:settings")],
         [InlineKeyboardButton("🚀 Publish Ongoing", callback_data="adm:publish_ongoing")],
@@ -233,10 +236,17 @@ def _menu_keyboard(menu: str):
             [InlineKeyboardButton("✏️ Edit / Add Buttons", callback_data="adm:ongoing_buttons_edit")],
             [InlineKeyboardButton("🔄 Refresh Template", callback_data="adm:ongoing_buttons_refresh")],
         ]
+    elif menu == "anime_buttons":
+        rows = [
+            [InlineKeyboardButton("✏️ Edit / Add Anime Buttons", callback_data="adm:anime_buttons_edit")],
+            [InlineKeyboardButton("🔄 Refresh Anime Buttons", callback_data="adm:anime_buttons_refresh")],
+        ]
     elif menu == "templates":
         rows = [
-            [InlineKeyboardButton("➕ Create Template Set", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Set Poster", callback_data="adm:template_edit")],
-            [InlineKeyboardButton("📋 View Templates", callback_data="adm:template_list")],
+            [InlineKeyboardButton("➕ Create Template Set", callback_data="adm:template_create"), InlineKeyboardButton("✏️ Edit Set", callback_data="adm:template_edit")],
+            [InlineKeyboardButton("📋 View Template Sets", callback_data="adm:template_list")],
+            [InlineKeyboardButton("🗑️ Delete Template Set", callback_data="adm:template_delete"), InlineKeyboardButton("🧹 Clear All Sets", callback_data="adm:template_clear_all")],
+            [InlineKeyboardButton("🎬 Anime Buttons", callback_data="adm:anime_buttons")],
             [InlineKeyboardButton("✏️ Main Ongoing Post Text", callback_data="adm:main_ongoing_text")],
             [InlineKeyboardButton("✏️ Anime Post Text", callback_data="adm:anime_post_text")],
         ]
@@ -244,6 +254,15 @@ def _menu_keyboard(menu: str):
         rows = []
     rows.append([InlineKeyboardButton("⬅️ Admin Home", callback_data="adm:home")])
     return InlineKeyboardMarkup(rows)
+
+
+def _template_edit_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📺 Edit Anime Channel", callback_data="adm:template_edit_channel")],
+        [InlineKeyboardButton("🔗 Edit / Add Invite Links", callback_data="adm:template_edit_invites")],
+        [InlineKeyboardButton("🖼️ Edit Ongoing Poster", callback_data="adm:template_edit_poster")],
+        [InlineKeyboardButton("⬅️ Templates", callback_data="adm:templates")],
+    ])
 
 
 async def _set_admin_state(user_id: int, stage: str, data: dict | None = None):
@@ -532,6 +551,19 @@ async def _ongoing_buttons_summary():
     )
 
 
+async def _anime_buttons_summary():
+    settings = await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].find_one({"_id": "global"}) or {}
+    template = settings.get("anime_buttons_template") or DEFAULT_ANIME_BUTTONS_TEMPLATE
+    return (
+        "🎬 ANIME POST QUALITY BUTTONS\n\n"
+        "These buttons are used only under Anime Post channel messages. They link to the 480p, 720p, and 1080p File Store URLs.\n\n"
+        f"Current template:\n{template}\n\n"
+        "Colors: #b = blue, #r = red, #g = green.\n"
+        "Use one button per line, or put multiple buttons on one row with ` | ` between button definitions.\n"
+        "Required URL placeholders: {quality_480p}, {quality_720p}, {quality_1080p}. Ongoing Buttons remain separate."
+    )
+
+
 @Client.on_message(filters.private & filters.command("admin"))
 async def admin_dashboard(client: Client, message: Message):
     if not is_admin_user(getattr(message, "from_user", None)):
@@ -677,6 +709,7 @@ async def handle_admin_session_input(client: Client, message: Message):
                     "title": title, "title_key": key,
                     "individual_channel": chat_id,
                     "individual_channel_title": channel_title,
+                    "template_set": True,
                     "updated_at": _now_utc(),
                 }, "$setOnInsert": {"created_at": _now_utc()}},
                 upsert=True,
@@ -711,6 +744,10 @@ async def handle_admin_session_input(client: Client, message: Message):
             if not rows:
                 raise ValueError("Send at least one invite-link line, for example: DOWNLOAD NOW | https://t.me/+invite-link")
             added, updated = await _upsert_invite_links(title, rows)
+            await codeflixbots.codeflixbots[INVITES_COLLECTION].update_one(
+                {"_id": data.get("title_key")},
+                {"$set": {"template_set": True, "updated_at": _now_utc()}},
+            )
             await _set_admin_state(user.id, "template_create_set_poster", data)
             await message.reply_text(
                 f"✅ Ongoing invite link(s) saved for {title}. Added: {added}; updated: {updated}.\n\n"
@@ -729,7 +766,7 @@ async def handle_admin_session_input(client: Client, message: Message):
                 {"_id": key},
                 {"$set": {
                     "title": title, "title_key": key, "poster_file_id": poster_id,
-                    "setup_complete": True, "setup_version": 1, "updated_at": _now_utc(),
+                    "setup_complete": True, "setup_version": 1, "template_set": True, "updated_at": _now_utc(),
                 }, "$setOnInsert": {"created_at": _now_utc()}},
                 upsert=True,
             )
@@ -767,9 +804,12 @@ async def handle_admin_session_input(client: Client, message: Message):
             key = _title_key(title)
             doc = await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find_one({"_id": key})
             if not doc:
-                raise ValueError(f"No saved template named {title!r}. Use Templates → View Templates to see saved names.")
-            await _set_admin_state(user.id, "template_edit_poster", {"title": doc.get("title") or title, "title_key": key})
-            await message.reply_text(f"Send the new poster for {doc.get('title') or title}, or send KEEP to keep its current poster.")
+                raise ValueError(f"No saved Template Set named {title!r}. Use Templates → View Template Sets to see saved names.")
+            await _set_admin_state(user.id, "template_edit_menu", {"title": doc.get("title") or title, "title_key": key})
+            await message.reply_text(
+                f"✏️ Edit Template Set: {doc.get('title') or title}\nChoose which saved setting to update.",
+                reply_markup=_template_edit_keyboard(),
+            )
 
         elif stage == "template_edit_poster":
             title, key = data.get("title", ""), data.get("title_key", "")
@@ -778,12 +818,116 @@ async def handle_admin_session_input(client: Client, message: Message):
                 await message.reply_text(f"✅ Kept the saved poster for {title}.", reply_markup=_admin_main_keyboard())
             elif message.photo:
                 poster_id = _message_photo_file_id(message)
-                await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one({"_id": key}, {"$set": {"poster_file_id": poster_id, "updated_at": _now_utc()}})
-                await _route_collection().update_one({"title_key": key}, {"$set": {"poster_file_id": poster_id, "updated_at": _now_utc()}}, upsert=True)
+                await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].update_one({"_id": key}, {"$set": {"poster_file_id": poster_id, "template_set": True, "updated_at": _now_utc()}})
+                await _route_collection().update_one({"title_key": key}, {"$set": {"poster_file_id": poster_id, "template_set": True, "updated_at": _now_utc()}}, upsert=True)
                 await _clear_admin_state(user.id)
                 await message.reply_text(f"✅ Poster updated for {title}.", reply_markup=_admin_main_keyboard())
             else:
                 raise ValueError("Send a poster photo or type KEEP.")
+
+        elif stage == "template_edit_channel_forward":
+            title, key = (data.get("title") or "").strip(), (data.get("title_key") or "").strip()
+            source_chat = _forwarded_channel_from_message(message)
+            source_type = getattr(source_chat, "type", None) if source_chat is not None else None
+            source_type = str(getattr(source_type, "value", source_type)).casefold().split(".")[-1]
+            if source_chat is None or source_type != "channel":
+                raise ValueError("Forward an original message directly from the anime channel. Do not copy/paste it.")
+            chat_id = int(source_chat.id)
+            await _validate_post_rights(client, chat_id)
+            channel_title = getattr(source_chat, "title", None) or title
+            await _route_collection().update_one(
+                {"title_key": key},
+                {"$set": {"title": title, "title_key": key, "individual_channel": chat_id,
+                           "individual_channel_title": channel_title, "template_set": True, "updated_at": _now_utc()},
+                 "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text(f"✅ Anime channel updated for {title}: {channel_title} (`{chat_id}`).", reply_markup=_admin_main_keyboard())
+
+        elif stage == "template_edit_invite_links":
+            title, key = (data.get("title") or "").strip(), (data.get("title_key") or "").strip()
+            raw_text = (message.text or message.caption or "").strip()
+            rows, errors = [], []
+            for line_number, line in enumerate(raw_text.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    parsed = _parse_invite_line(line)
+                    if not parsed:
+                        errors.append(f"Line {line_number}: use Button Name | https://t.me/+invite-link")
+                    else:
+                        rows.append(parsed)
+                except ValueError as exc:
+                    errors.append(f"Line {line_number}: {exc}")
+            if errors:
+                raise ValueError("\n".join(errors))
+            if not rows:
+                raise ValueError("Send at least one invite link line.")
+            added, updated = await _upsert_invite_links(title, rows)
+            await codeflixbots.codeflixbots[INVITES_COLLECTION].update_one(
+                {"_id": key}, {"$set": {"template_set": True, "title_key": key, "updated_at": _now_utc()}}
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text(
+                f"✅ Invite links updated for {title}. Added: {added}; updated: {updated}.\n"
+                "Links with the same button name are replaced; other saved buttons are kept. Use Anime Invite Links → Remove Link to remove an old button.",
+                reply_markup=_admin_main_keyboard(),
+            )
+
+        elif stage == "template_delete_name":
+            title = (message.text or "").strip()
+            key = _title_key(title)
+            if not key:
+                raise ValueError("Send the exact saved Template Set title.")
+            saved = await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find_one({"_id": key})
+            route = await _route_collection().find_one({"title_key": key})
+            invite = await codeflixbots.codeflixbots[INVITES_COLLECTION].find_one({"_id": key})
+            if not saved and not (route and route.get("template_set")):
+                raise ValueError(f"No saved Template Set named {title!r} was found.")
+            await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].delete_one({"_id": key})
+            await _route_collection().delete_one({"title_key": key})
+            await codeflixbots.codeflixbots[INVITES_COLLECTION].delete_one({"_id": key})
+            await _clear_admin_state(user.id)
+            await message.reply_text(
+                f"✅ Template Set deleted: {title}.\nIts saved Anime channel assignment, ongoing invite links, and ongoing poster were removed. Episode history and global text/button templates were kept.",
+                reply_markup=_admin_main_keyboard(),
+            )
+
+        elif stage == "anime_buttons_template":
+            template = (message.text or message.caption or "").strip()
+            if not template:
+                raise ValueError("Send the full Anime Buttons template.")
+            if len(template) > 6000:
+                raise ValueError("Keep the Anime Buttons template under 6000 characters.")
+            parsed_buttons = []
+            for line_number, line in enumerate((line.strip() for line in template.splitlines() if line.strip()), start=1):
+                for item in line.split(" | "):
+                    match = re.match(r"^#([bgr])\s+(.+?)\s+-\s*(.*?)\s*$", item.strip(), re.IGNORECASE)
+                    if not match:
+                        raise ValueError(f"Line {line_number}: use #b/#r/#g Button Name - {{quality_480p}} (or the matching quality placeholder).")
+                    color, label, raw_url = match.groups()
+                    if not label.strip() or len(label.strip()) > 64:
+                        raise ValueError(f"Line {line_number}: button labels must be 1–64 characters.")
+                    normalized_url = raw_url.strip().casefold()
+                    aliases = {
+                        "{quality_480p}": "480p", "{link_480p}": "480p", "{480p}": "480p",
+                        "{quality_720p}": "720p", "{link_720p}": "720p", "{720p}": "720p",
+                        "{quality_1080p}": "1080p", "{link_1080p}": "1080p", "{1080p}": "1080p",
+                    }
+                    quality = aliases.get(normalized_url)
+                    if not quality:
+                        raise ValueError(f"Line {line_number}: URL must be exactly one quality placeholder: {{quality_480p}}, {{quality_720p}}, or {{quality_1080p}}.")
+                    parsed_buttons.append(quality)
+            if len(parsed_buttons) != 3 or set(parsed_buttons) != {"480p", "720p", "1080p"}:
+                raise ValueError("The template must include exactly one button for each of 480p, 720p, and 1080p.")
+            await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].update_one(
+                {"_id": "global"},
+                {"$set": {"anime_buttons_template": template, "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text("✅ Anime Buttons template saved. New Anime Post channel messages will use the updated labels, row layout, and #b/#r/#g styles. Ongoing Buttons are unchanged.", reply_markup=_admin_main_keyboard())
 
         elif stage == "ongoing_buttons_template":
             template = (message.text or message.caption or "").strip()
@@ -1236,7 +1380,11 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             await query.message.edit_text("🍥 **ANIFLIX AUTO-RENAME BOT — ADMIN PANEL**\n\nChoose a section below.", reply_markup=_admin_main_keyboard())
         except Exception:
             await query.message.reply_text("ANIFLIX Auto-Rename Bot — Admin Panel", reply_markup=_admin_main_keyboard())
-    elif action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "ongoing_buttons", "templates"}:
+    elif action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "ongoing_buttons", "anime_buttons", "templates"}:
+        if action == "templates":
+            active_session = await _get_admin_state(user.id)
+            if active_session and active_session.get("stage") == "template_edit_menu":
+                await _clear_admin_state(user.id)
         titles = {
             "anime_channels": "📺 ANIME CHANNELS — Add, edit, remove, or view each anime's individual and ongoing destinations.",
             "invites": "🔗 ANIME INVITE LINKS — Manage the buttons used in manual ongoing posts.",
@@ -1246,9 +1394,10 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             "settings": "⚙️ BOT SETTINGS — Force Subscribe and channel configuration.",
             "post_customization": "📝 POST TEXT — Configure the shared Main Ongoing Post Text and shared Anime Post Text.",
             "ongoing_buttons": await _ongoing_buttons_summary(),
+            "anime_buttons": await _anime_buttons_summary(),
             "templates": await _saved_templates_text(),
         }
-        keyboard_key = action if action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "ongoing_buttons", "templates"} else "settings"
+        keyboard_key = action if action in {"anime_channels", "invites", "ongoing_channels", "fsub", "episode_manager", "settings", "post_customization", "ongoing_buttons", "anime_buttons", "templates"} else "settings"
         try:
             await query.message.edit_text(titles[action], reply_markup=_menu_keyboard(keyboard_key), disable_web_page_preview=True)
         except Exception:
@@ -1311,6 +1460,47 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
         await _prompt(client, user.id, "template_create_name", "Send the Template Set title exactly as you will type it in the /batch details, e.g. Naruto.")
     elif action in {"template_edit"}:
         await _prompt(client, user.id, "template_edit_name", "Send the exact name of the saved template you want to edit.")
+    elif action in {"template_edit_channel", "template_edit_invites", "template_edit_poster"}:
+        session = await _get_admin_state(user.id)
+        if not session or session.get("stage") != "template_edit_menu":
+            return await client.send_message(user.id, "Start Templates → Edit Set again and enter the saved set title first.")
+        data = session.get("data") or {}
+        if action == "template_edit_channel":
+            await _set_admin_state(user.id, "template_edit_channel_forward", data)
+            await client.send_message(user.id, f"Forward a message from the new Anime Post channel for {data.get('title')}. The bot must be an admin with posting permission.")
+        elif action == "template_edit_invites":
+            await _set_admin_state(user.id, "template_edit_invite_links", data)
+            await client.send_message(user.id, f"Send invite buttons for {data.get('title')}, one per line:\nDOWNLOAD NOW | https://t.me/+invite-link\n\nSame button names are updated; other saved buttons are kept. Use /cancel to leave this edit.")
+        else:
+            await _set_admin_state(user.id, "template_edit_poster", data)
+            await client.send_message(user.id, f"Send the new ongoing poster photo for {data.get('title')}, or send KEEP to preserve the current poster.")
+    elif action == "template_delete":
+        await _prompt(client, user.id, "template_delete_name", "Send the exact saved Template Set title to delete, e.g. Naruto. Its Anime channel assignment, invite links, and ongoing poster will also be removed; episode history and global templates are kept.")
+    elif action == "template_clear_all":
+        templates = await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].find({}).to_list(length=1000)
+        routes = await _route_collection().find({"template_set": True}).to_list(length=1000)
+        invites = await codeflixbots.codeflixbots[INVITES_COLLECTION].find({"template_set": True}).to_list(length=1000)
+        keys = set()
+        for item in templates:
+            key = str(item.get("title_key") or item.get("_id") or "").strip()
+            if key:
+                keys.add(key)
+        for item in routes:
+            key = str(item.get("title_key") or "").strip()
+            if key:
+                keys.add(key)
+        for item in invites:
+            key = str(item.get("title_key") or item.get("_id") or "").strip()
+            if key:
+                keys.add(key)
+        t_result = await codeflixbots.codeflixbots[TEMPLATES_COLLECTION].delete_many({})
+        await _clear_admin_state(user.id)
+        r_result = await _route_collection().delete_many({"title_key": {"$in": list(keys)}}) if keys else None
+        i_result = await codeflixbots.codeflixbots[INVITES_COLLECTION].delete_many({"$or": [{"_id": {"$in": list(keys)}}, {"title_key": {"$in": list(keys)}}]}) if keys else None
+        await query.message.reply_text(
+            f"✅ Cleared all saved Template Sets.\nTemplate records removed: {t_result.deleted_count}; channel assignments removed: {r_result.deleted_count if r_result else 0}; invite records removed: {i_result.deleted_count if i_result else 0}.\n\nEpisode history, the global Anime Post text, Main Ongoing Post text, and both global button templates were kept.",
+            reply_markup=_menu_keyboard("templates"),
+        )
     elif action == "template_list":
         await client.send_message(user.id, await _saved_templates_text(), reply_markup=_menu_keyboard("templates"))
     elif action == "ongoing_buttons_refresh":
@@ -1319,6 +1509,21 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             await query.message.edit_text(text, reply_markup=_menu_keyboard("ongoing_buttons"), disable_web_page_preview=True)
         except Exception:
             await client.send_message(user.id, text, reply_markup=_menu_keyboard("ongoing_buttons"), disable_web_page_preview=True)
+    elif action == "anime_buttons_refresh":
+        text = await _anime_buttons_summary()
+        try:
+            await query.message.edit_text(text, reply_markup=_menu_keyboard("anime_buttons"), disable_web_page_preview=True)
+        except Exception:
+            await client.send_message(user.id, text, reply_markup=_menu_keyboard("anime_buttons"), disable_web_page_preview=True)
+    elif action == "anime_buttons_edit":
+        await _prompt(
+            client, user.id, "anime_buttons_template",
+            "Send the complete Anime Post button template. Each button has a color code and matching quality URL placeholder.\n\n"
+            "Default (all three buttons on one row):\n"
+            "#b 480P - {quality_480p} | #r 720P - {quality_720p} | #g 1080P - {quality_1080p}\n\n"
+            "Colors: #b = blue, #r = red, #g = green. Use each quality placeholder exactly once. Put all three on one line with ` | ` for one row, or use separate lines for separate rows.\n"
+            "This affects Anime Post quality buttons only; Ongoing Buttons are unchanged."
+        )
     elif action == "ongoing_buttons_edit":
         await _prompt(
             client, user.id, "ongoing_buttons_template",
