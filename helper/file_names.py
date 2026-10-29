@@ -5,10 +5,10 @@ from pathlib import Path
 
 _SEASON_EPISODE_PATTERNS = (
     re.compile(
-        r"(?i)\bS(?:eason)?[ ._-]*(\d{1,2})[ ._-]*E(?:P|pisode)?[ ._-]*(\d{1,3})\b"
+        r"(?i)\bS(?:eason)?[ ._-]*(\d{1,2})[ ._-]*E(?:P|pisode)?[ ._-]*(\d{1,6})\b"
     ),
-    re.compile(r"(?i)\bSeason[ ._-]*(\d{1,2})[ ._-]*Episode[ ._-]*(\d{1,3})\b"),
-    re.compile(r"(?i)\b(?:Episode|EP|E)[ ._-]*(\d{1,3})\b"),
+    re.compile(r"(?i)\bSeason[ ._-]*(\d{1,2})[ ._-]*Episode[ ._-]*(\d{1,6})\b"),
+    re.compile(r"(?i)\b(?:Episode|EP|E)[ ._-]*(\d{1,6})\b"),
 )
 _QUALITY_PATTERNS = (
     re.compile(r"(?i)\b(2160p|1440p|1080p|720p|480p|360p|240p)\b"),
@@ -73,7 +73,7 @@ def normalize_anime_title(value: str) -> str:
         text,
     )
     text = re.sub(r"(?i)^\s*@?aniflixanimetamil\s*[-|:]+\s*", "", text)
-    text = re.sub(r"(?i)\b(?:S(?:eason)?[ ._-]*\d{1,2}[ ._-]*E(?:P|pisode)?[ ._-]*\d{1,3}|Season[ ._-]*\d{1,2}[ ._-]*Episode[ ._-]*\d{1,3}|(?:Episode|EP|E)[ ._-]*\d{1,3})\b", " ", text)
+    text = re.sub(r"(?i)\b(?:S(?:eason)?[ ._-]*\d{1,2}[ ._-]*E(?:P|pisode)?[ ._-]*\d{1,6}|Season[ ._-]*\d{1,2}[ ._-]*Episode[ ._-]*\d{1,6}|(?:Episode|EP|E)[ ._-]*\d{1,6})\b", " ", text)
     text = re.sub(r"(?i)\b(2160p|1440p|1080p|720p|480p|360p|240p|4k|8k|2k)\b", " ", text)
     text = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", text)
     text = text.replace("@ANIFLIXANIMETAMIL", " ")
@@ -98,7 +98,7 @@ def extract_title(filename: str) -> str:
     stem = re.sub(r"(?i)\b(by|uploaded\s+by|source)\s*[:_-]?\s*$", " ", stem)
     # The parser intentionally exposes a start episode for a range (e.g. E335-336).
     # Remove the remaining trailing range endpoint before deriving the anime title.
-    stem = re.sub(r"\s*[-–]\s*\d{1,3}\b\s*$", " ", stem)
+    stem = re.sub(r"\s*[-–]\s*\d{1,6}\b\s*$", " ", stem)
     stem = re.sub(r"[._]+", " ", stem)
     stem = _WHITESPACE.sub(" ", stem).strip(" .-_[]()")
     # Repeated separators left behind by removed tags should not leak into the title.
