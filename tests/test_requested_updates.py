@@ -13,7 +13,8 @@ def _load_batch_parser():
     tree = ast.parse(source)
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {"_parse_upload_details", "_parse_batch_command"}]
     module = ast.Module(body=nodes, type_ignores=[])
-    namespace = {"re": re}
+    from urllib.parse import urlparse
+    namespace = {"re": re, "urlparse": urlparse}
     exec(compile(module, "plugins/file_rename.py", "exec"), namespace)
     return namespace["_parse_upload_details"], namespace["_parse_batch_command"]
 
@@ -35,6 +36,50 @@ class RequestedUpdateTests(unittest.TestCase):
             "season": "1",
             "episode_range": "01-14",
         })
+
+    def test_batch1renamed_accepts_single_and_range_episode_values(self):
+        for episode, expected in (("04", "04"), ("01 - 04", "01-04"), ("15", "15"), ("590", "590"), ("1000", "1000")):
+            with self.subTest(episode=episode):
+                batch_number, result = self.parse_command(f"/batch1renamed\nNaruto\nSeason 01\n{episode}")
+                self.assertEqual(batch_number, 1)
+                self.assertTrue(result["skip_rename"])
+                self.assertEqual(result["episode_range"], expected)
+
+    def test_batch1renamed_link_only_parses_stored_url_without_changing_episode(self):
+        batch_number, result = self.parse_command(
+            "/batch1renamed\nNaruto\nSeason 01\n590\nhttps://t.me/Aniflixanimefilestorebot?start=ABC123"
+        )
+        self.assertEqual(batch_number, 1)
+        self.assertTrue(result["skip_rename"])
+        self.assertTrue(result["link_only"])
+        self.assertEqual(result["episode_range"], "590")
+        self.assertEqual(result["stored_link"], "https://t.me/Aniflixanimefilestorebot?start=ABC123")
+
+    def test_batch1renamed_still_supports_file_store_mode_without_link(self):
+        batch_number, result = self.parse_command("/batch1renamed\nNaruto\nSeason 01\n01 - 04")
+        self.assertEqual(batch_number, 1)
+        self.assertTrue(result["skip_rename"])
+        self.assertNotIn("link_only", result)
+        self.assertEqual(result["episode_range"], "01-04")
+
+    def test_link_only_button_template_renders_episode_and_uses_supplied_url(self):
+        from urllib.parse import urlparse
+        import re
+        source = (ROOT / "plugins" / "file_rename.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"_build_batch1renamed_button_rows"}
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+        assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE" for t in n.targets))
+        namespace = {"re": re, "urlparse": urlparse}
+        exec(compile(ast.Module(body=[assignment, *nodes], type_ignores=[]), "plugins/file_rename.py", "exec"), namespace)
+        rows = namespace["_build_batch1renamed_button_rows"](
+            "#g EPISODE {episode} - {link}",
+            {"title": "Naruto", "season": "1", "episode_range": "590"},
+            "https://t.me/stored/file",
+        )
+        self.assertEqual(rows[0][0]["text"], "EPISODE 590")
+        self.assertEqual(rows[0][0]["url"], "https://t.me/stored/file")
+        self.assertEqual(rows[0][0]["style"], "success")
 
     def test_large_episode_numbers_keep_entered_digits(self):
         for episode in ("15", "1000", "590", "05", "09"):
@@ -92,6 +137,14 @@ class RequestedUpdateTests(unittest.TestCase):
         handler = source[source.index("async def _deliver_file_token"):source.index('@Client.on_message(filters.private & filters.command("start"))')]
         self.assertIn("check_fsub_membership(client, user_id)", handler)
         self.assertLess(handler.index("check_fsub_membership(client, user_id)"), handler.index('"file_store"'))
+
+    def test_link_only_publish_and_custom_button_template_are_wired(self):
+        file_rename = (ROOT / "plugins" / "file_rename.py").read_text(encoding="utf-8")
+        panel = (ROOT / "plugins" / "admin_panel.py").read_text(encoding="utf-8")
+        self.assertIn('if details.get("link_only"):', file_rename)
+        self.assertIn('_send_ongoing_bot_api(client, int(chat.id), None, caption, button_rows)', file_rename)
+        self.assertIn('batch1renamed_button_template', panel)
+        self.assertIn('adm:batch1renamed_button_edit', panel)
 
     def test_stored_files_and_link_replacement_are_wired(self):
         panel = (ROOT / "plugins" / "admin_panel.py").read_text(encoding="utf-8")

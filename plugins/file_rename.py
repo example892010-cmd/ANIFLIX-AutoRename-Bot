@@ -10,6 +10,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PIL import Image
 from pyrogram import Client, enums, filters, StopPropagation
@@ -30,7 +31,10 @@ from helper.file_names import (
 )
 from helper.utils import progress_for_pyrogram
 from plugins.antinsfw import check_anti_nsfw
-from plugins.episode_publisher import _batch_id, store_file_and_process
+from plugins.episode_publisher import (
+    _batch_id, store_file_and_process, _safe_template,
+    DEFAULT_INDIVIDUAL_TEMPLATE, _send_ongoing_bot_api,
+)
 from plugins.channel_routing import resolve_ongoing_targets as _resolve_ongoing_targets_from_settings
 
 async def _resolve_ongoing_targets(route: dict) -> list:
@@ -238,25 +242,135 @@ def _batch_tasks_collection():
 
 
 def _parse_batch_command(message_text: str) -> tuple[int, dict] | None:
-    """Parse /batchN Anime Title + Season + Episode from the same message."""
+    """Parse /batchN details, including /batch1renamed's optional stored URL."""
     raw_lines = (message_text or "").splitlines()
     if not raw_lines:
         return None
-    command_match = re.match(r"^\s*/batch([1-5])(?:@\w+)?(?:\s+(.*))?\s*$", raw_lines[0], re.I)
+    command_match = re.match(r"^\s*/batch(1renamed|[1-5])(?:@\w+)?(?:\s+(.*))?\s*$", raw_lines[0], re.I)
     if not command_match:
         return None
-    batch_number = int(command_match.group(1))
+    command_mode = command_match.group(1).lower()
+    batch_number = 1 if command_mode == "1renamed" else int(command_mode)
     title_on_command = (command_match.group(2) or "").strip()
     detail_lines = ([title_on_command] if title_on_command else []) + [line.strip() for line in raw_lines[1:] if line.strip()]
+
+    stored_link = None
+    if command_mode == "1renamed" and len(detail_lines) >= 4:
+        candidate = detail_lines[-1].strip()
+        parsed_url = urlparse(candidate)
+        if parsed_url.scheme in {"https", "http"} and parsed_url.netloc:
+            stored_link = candidate
+            detail_lines = detail_lines[:-1]
+
     details = _parse_upload_details("\n".join(detail_lines))
     if not details:
         raise ValueError(
             "Send the batch command with anime details in this format:\n\n"
             "/batch1\nNaruto\nSeason 01\n04\n\n"
-            "The anime title must exactly match a completed Template Set to select its channel automatically."
+            "For already-stored links, add the URL on the line after the episode number:\n"
+            "/batch1renamed\nNaruto\nSeason 01\n590\nhttps://t.me/your_stored_link\n\n"
+            "The anime title must match a saved Anime Post channel."
             " Use /batch2, /batch3, /batch4, or /batch5 for separate tasks."
         )
+    if command_mode == "1renamed":
+        details["skip_rename"] = True
+        if stored_link:
+            details["link_only"] = True
+            details["stored_link"] = stored_link
     return batch_number, details
+
+
+DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE = "#g EPISODE {episode} - {link}"
+
+
+def _build_batch1renamed_button_rows(template: str, details: dict, stored_link: str) -> list[list[dict]]:
+    """Build customizable single-link buttons. Each URL must resolve to the supplied stored link."""
+    parsed_url = urlparse(str(stored_link or "").strip())
+    if parsed_url.scheme not in {"https", "http"} or not parsed_url.netloc:
+        raise ValueError("The stored link must be a complete http:// or https:// URL.")
+
+    values = {
+        "title": str(details.get("title") or "").strip(),
+        "anime": str(details.get("title") or "").strip(),
+        "season": str(details.get("season") or "").strip(),
+        "episode": str(details.get("episode_range") or "").strip(),
+        "episode_range": str(details.get("episode_range") or "").strip(),
+    }
+    style_map = {"b": "primary", "r": "danger", "g": "success"}
+    rows: list[list[dict]] = []
+    text = str(template or DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE).strip()
+    for line_number, line in enumerate((line.strip() for line in text.splitlines() if line.strip()), start=1):
+        row = []
+        for item in line.split(" | "):
+            match = re.match(r"^#([bgr])\s+(.+?)\s+-\s*(.*?)\s*$", item.strip(), re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Button line {line_number} is invalid. Use #g EPISODE {{episode}} - {{link}}.")
+            color, raw_label, raw_url = match.groups()
+            if raw_url.strip().casefold() not in {"{link}", "{url}", "{stored_link}"}:
+                raise ValueError(f"Button line {line_number} must use {{link}} as its URL so the supplied stored link is published.")
+            label = raw_label.strip()
+            for key, value in values.items():
+                label = re.sub(r"\{" + re.escape(key) + r"\}", lambda _m, v=value: v, label, flags=re.IGNORECASE)
+            if not label or len(label) > 64:
+                raise ValueError(f"Button line {line_number} label must be 1–64 characters after placeholders are filled.")
+            row.append({"text": label, "url": str(stored_link).strip(), "style": style_map[color.lower()]})
+        if row:
+            rows.append(row)
+    if not rows:
+        raise ValueError("The link-only button template needs at least one button.")
+    return rows
+
+
+async def _publish_batch1renamed_link(client, message, details: dict) -> None:
+    """Publish a supplied stored link without downloading or storing media again."""
+    title = str(details.get("title") or "").strip()
+    title_key = normalize_anime_title(title)
+    link = str(details.get("stored_link") or "").strip()
+    routes = codeflixbots.codeflixbots["anime_routes"]
+    route = await routes.find_one({"title_key": title_key}) if title_key else None
+    if not route and title:
+        route = await routes.find_one({"title": {"$regex": "^" + re.escape(title) + "$", "$options": "i"}})
+    if not route or not route.get("individual_channel"):
+        await message.reply_text(
+            f"❌ No Anime Post channel is saved for {title}. Add it in Admin Panel → Anime Channels first."
+        )
+        return
+
+    try:
+        settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
+        template = settings.get("batch1renamed_button_template") or DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE
+        button_rows = _build_batch1renamed_button_rows(template, details, link)
+        chat = await client.get_chat(route["individual_channel"])
+        caption_template = settings.get("anime_post_template") or DEFAULT_INDIVIDUAL_TEMPLATE
+        episode = str(details.get("episode_range") or "").strip()
+        caption_values = {
+            "title": title, "anime": title,
+            "season": str(details.get("season") or ""),
+            "episode": episode, "episode_range": episode,
+            "qualities": "Stored link", "status": "ON", "audio": "Tamil Audio",
+            "quality_480p": "", "quality_720p": "", "quality_1080p": "",
+            "link_480p": "", "link_720p": "", "link_1080p": "",
+        }
+        caption = _safe_template(caption_template, caption_values)
+        sent_id = await _send_ongoing_bot_api(client, int(chat.id), None, caption, button_rows)
+        try:
+            await codeflixbots.codeflixbots["renamed_link_posts"].insert_one({
+                "user_id": int(message.from_user.id), "title": title, "title_key": title_key,
+                "season": str(details.get("season") or ""), "episode": episode,
+                "url": link, "channel_id": int(chat.id), "message_id": int(sent_id),
+                "created_at": datetime.utcnow(),
+            })
+        except Exception:
+            logger.exception("Post sent but link-only history could not be saved")
+        await message.reply_text(
+            f"✅ Link-only Anime Post published.\n🎬 {title} • Season {details.get('season')} • Episode {episode}\n"
+            f"📺 Channel: {getattr(chat, 'title', None) or route['individual_channel']}\n"
+            f"🔘 Button: {button_rows[0][0]['text']}\n"
+            "No media was downloaded or stored by this command."
+        )
+    except Exception as exc:
+        logger.exception("Link-only /batch1renamed publishing failed")
+        await message.reply_text(f"❌ Could not publish the stored link: {type(exc).__name__}: {exc}")
 
 
 async def _active_batch_task(user_id: int) -> dict | None:
@@ -282,7 +396,7 @@ async def _batch_routes_keyboard(user_id: int, batch_number: int, routes: list[d
     return route_choices, InlineKeyboardMarkup(rows) if rows else None
 
 
-@Client.on_message(filters.private & filters.command(["batch1", "batch2", "batch3", "batch4", "batch5"]), group=-7)
+@Client.on_message(filters.private & filters.command(["batch1", "batch2", "batch3", "batch4", "batch5", "batch1renamed"]), group=-7)
 async def start_manual_batch(client: Client, message):
     user = getattr(message, "from_user", None)
     if not user:
@@ -297,6 +411,12 @@ async def start_manual_batch(client: Client, message):
     if not parsed:
         return
     batch_number, details = parsed
+
+    # An extra URL line selects link-only publication: no batch task, file download,
+    # rename, or File Store operation is created for this path.
+    if details.get("link_only"):
+        await _publish_batch1renamed_link(client, message, details)
+        return
 
     active = await _active_batch_task(user.id)
     if active:
@@ -861,7 +981,8 @@ async def auto_rename_files(client, message, _details: dict | None = None):
         logger.exception("Could not read rename format for user %s", user_id)
         return await message.reply_text("❌ Couldn't read your settings. Please try /start again.")
 
-    if not format_template:
+    skip_rename = bool((_details or {}).get("skip_rename"))
+    if not format_template and not skip_rename:
         return await message.reply_text("Please set a rename format using /autorename first.")
 
     if message.document:
@@ -910,7 +1031,7 @@ async def auto_rename_files(client, message, _details: dict | None = None):
     started_at = time.perf_counter()
     timings = {}
     try:
-        new_filename = _render_filename_for_details(original_name, format_template, _details)
+        new_filename = original_name if skip_rename else _render_filename_for_details(original_name, format_template, _details)
         extension = Path(original_name).suffix.lower()
         if not re.fullmatch(r"\.[a-z0-9]{1,10}", extension):
             extension = ""
@@ -942,14 +1063,15 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             source_quality = extract_quality(original_name)
             if (extension in VIDEO_EXTENSIONS or media_type == "video") and source_quality.strip().casefold() == "unknown":
                 detected_quality = await _detect_video_quality(downloaded_path, media)
-            new_filename = _render_filename_for_details(
-                original_name, format_template, _details, quality_override=detected_quality
-            )
+            if not skip_rename:
+                new_filename = _render_filename_for_details(
+                    original_name, format_template, _details, quality_override=detected_quality
+                )
 
             current_path = downloaded_path
             stage_started = time.perf_counter()
             meta_state = await codeflixbots.get_metadata(user_id)
-            if metadata_enabled(meta_state) and extension in METADATA_EXTENSIONS:
+            if not skip_rename and metadata_enabled(meta_state) and extension in METADATA_EXTENSIONS:
                 await _safe_edit(status, "🧩 Applying metadata (this may take extra time)...")
                 metadata_path = os.path.join(work_dir, f"metadata{extension}")
                 try:
@@ -960,7 +1082,7 @@ async def auto_rename_files(client, message, _details: dict | None = None):
                     # Metadata is optional: a metadata problem must not prevent a rename.
                     logger.exception("Metadata failed for %s; continuing with original file", original_name)
                     await _safe_edit(status, "⚠️ Metadata skipped; continuing with rename...")
-            elif metadata_enabled(meta_state):
+            elif not skip_rename and metadata_enabled(meta_state):
                 logger.info("Metadata skipped for unsupported file extension %s", extension)
             timings["metadata"] = time.perf_counter() - stage_started
 
@@ -994,7 +1116,7 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             elif upload_type == "audio" and extension not in SEND_AUDIO_EXTENSIONS:
                 upload_type = "document"
 
-            await _safe_edit(status, "⏫ Uploading renamed file...")
+            await _safe_edit(status, "⏫ Uploading file without renaming..." if skip_rename else "⏫ Uploading renamed file...")
             try:
                 await status.edit_reply_markup(_PROGRESS_KEYBOARD)
             except Exception:
@@ -1052,7 +1174,7 @@ async def auto_rename_files(client, message, _details: dict | None = None):
         )
         final_result = storage_result or "✅ Done! File renamed successfully."
         await _safe_edit(status, final_result)
-        logger.info("Renamed %s -> %s for user %s", original_name, new_filename, user_id)
+        logger.info("%s %s -> %s for user %s", "Passed through" if skip_rename else "Renamed", original_name, new_filename, user_id)
         return final_result
 
     except FloodWait as exc:

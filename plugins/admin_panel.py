@@ -241,6 +241,7 @@ def _menu_keyboard(menu: str):
     elif menu == "anime_buttons":
         rows = [
             [InlineKeyboardButton("✏️ Edit / Add Anime Buttons", callback_data="adm:anime_buttons_edit")],
+            [InlineKeyboardButton("🔗 Link-only Batch Button", callback_data="adm:batch1renamed_button_edit")],
             [InlineKeyboardButton("🔄 Refresh Anime Buttons", callback_data="adm:anime_buttons_refresh")],
         ]
     elif menu == "templates":
@@ -716,13 +717,16 @@ async def _ongoing_buttons_summary():
 async def _anime_buttons_summary():
     settings = await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].find_one({"_id": "global"}) or {}
     template = settings.get("anime_buttons_template") or DEFAULT_ANIME_BUTTONS_TEMPLATE
+    link_only_template = settings.get("batch1renamed_button_template") or "#g EPISODE {episode} - {link}"
     return (
-        "🎬 ANIME POST QUALITY BUTTONS\n\n"
-        "These buttons are used only under Anime Post channel messages. They link to the 480p, 720p, and 1080p File Store URLs.\n\n"
-        f"Current template:\n{template}\n\n"
-        "Colors: #b = blue, #r = red, #g = green.\n"
-        "Use one button per line, or put multiple buttons on one row with ` | ` between button definitions.\n"
-        "Required URL placeholders: {quality_480p}, {quality_720p}, {quality_1080p}. Ongoing Buttons remain separate."
+        "🎬 ANIME POST BUTTONS\n\n"
+        "Regular Anime Post quality buttons (stored 480p / 720p / 1080p links):\n"
+        f"{template}\n\n"
+        "Link-only /batch1renamed button template (uses the URL supplied after the episode number):\n"
+        f"{link_only_template}\n\n"
+        "Colors: #b = blue, #r = red, #g = green. One button per line; use ` | ` to place several buttons on one row.\n"
+        "For link-only batches, the URL must be {link} (or {url}/{stored_link}). Label placeholders: {title}, {anime}, {season}, {episode}, {episode_range}.\n"
+        "Edit regular quality buttons or tap Link-only Batch Button to change that template."
     )
 
 
@@ -1207,6 +1211,41 @@ async def handle_admin_session_input(client: Client, message: Message):
             )
             await _clear_admin_state(user.id)
             await message.reply_text("✅ Anime Buttons template saved. New Anime Post channel messages will use the updated labels, row layout, and #b/#r/#g styles. Ongoing Buttons are unchanged.", reply_markup=_admin_main_keyboard())
+
+        elif stage == "batch1renamed_button_template":
+            template = (message.text or message.caption or "").strip()
+            if not template:
+                raise ValueError("Send the link-only button template, or use /cancel to leave without saving.")
+            if len(template) > 6000:
+                raise ValueError("Keep the button template under 6000 characters.")
+            parsed_count = 0
+            allowed_placeholders = {"title", "anime", "season", "episode", "episode_range"}
+            for line_number, line in enumerate((line.strip() for line in template.splitlines() if line.strip()), start=1):
+                for item in line.split(" | "):
+                    match = re.match(r"^#([bgr])\s+(.+?)\s+-\s*(.*?)\s*$", item.strip(), re.IGNORECASE)
+                    if not match:
+                        raise ValueError(f"Line {line_number}: use #g EPISODE {{episode}} - {{link}}.")
+                    _color, label, raw_url = match.groups()
+                    if not label.strip() or len(label.strip()) > 64:
+                        raise ValueError(f"Line {line_number}: button label must be 1–64 characters before placeholders are filled.")
+                    if raw_url.strip().casefold() not in {"{link}", "{url}", "{stored_link}"}:
+                        raise ValueError(f"Line {line_number}: URL must be {{link}} so the command's supplied stored URL is used.")
+                    for placeholder in re.findall(r"\{([^{}]+)\}", label):
+                        if placeholder.casefold() not in allowed_placeholders:
+                            raise ValueError(f"Unknown label placeholder {{{placeholder}}}. Use {{title}}, {{anime}}, {{season}}, {{episode}}, or {{episode_range}}.")
+                    parsed_count += 1
+            if parsed_count < 1:
+                raise ValueError("Add at least one button line.")
+            await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].update_one(
+                {"_id": "global"},
+                {"$set": {"batch1renamed_button_template": template, "updated_at": _now_utc()}, "$setOnInsert": {"created_at": _now_utc()}},
+                upsert=True,
+            )
+            await _clear_admin_state(user.id)
+            await message.reply_text(
+                "✅ Link-only /batch1renamed button template saved. It applies only when you put a stored URL below the episode number. Regular /batch1renamed file processing and regular Anime Buttons are unchanged.",
+                reply_markup=_admin_main_keyboard(),
+            )
 
         elif stage == "ongoing_buttons_template":
             template = (message.text or message.caption or "").strip()
@@ -1873,6 +1912,17 @@ async def admin_panel_callback(client: Client, query: CallbackQuery):
             "#b 480P - {quality_480p} | #r 720P - {quality_720p} | #g 1080P - {quality_1080p}\n\n"
             "Colors: #b = blue, #r = red, #g = green. Use each quality placeholder exactly once. Put all three on one line with ` | ` for one row, or use separate lines for separate rows.\n"
             "This affects Anime Post quality buttons only; Ongoing Buttons are unchanged."
+        )
+    elif action == "batch1renamed_button_edit":
+        settings = await codeflixbots.codeflixbots[POST_TEMPLATES_COLLECTION].find_one({"_id": "global"}) or {}
+        current = settings.get("batch1renamed_button_template") or "#g EPISODE {episode} - {link}"
+        await _prompt(
+            client, user.id, "batch1renamed_button_template",
+            "Send the link-only /batch1renamed button template.\n\n"
+            f"Current template:\n{current}\n\n"
+            "Example: #g EPISODE {episode} - {link}\n"
+            "Colors: #b = blue, #r = red, #g = green. One button per line; use ` | ` for multiple buttons on one row.\n"
+            "Supported label placeholders: {title}, {anime}, {season}, {episode}, {episode_range}. The URL must be {link} (or {url}/{stored_link}) so your supplied stored link is used. Send /cancel to leave without saving."
         )
     elif action == "ongoing_buttons_edit":
         await _prompt(
