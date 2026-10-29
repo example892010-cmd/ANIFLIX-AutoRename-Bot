@@ -317,7 +317,7 @@ async def _send_target(client, route: dict, batch: dict, mode: str, target_overr
                 raise
     title = batch["title"]
     season = batch["season"]
-    episode = batch["episode"]
+    episode = batch.get("episode_display") or batch["episode"]
     files = batch["files"]
     global_templates = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
     route = dict(route)
@@ -744,14 +744,22 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
         season = str(int(str(season).strip())) if season else None
     except (ValueError, TypeError):
         season = None
+    episode_display = str(episode).strip() if episode else None
     if episode:
-        range_match = re.fullmatch(r"\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*", str(episode))
+        range_match = re.fullmatch(r"\s*(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?\s*", str(episode))
         if range_match:
-            first_ep = str(int(range_match.group(1)))
-            last_ep = str(int(range_match.group(2))) if range_match.group(2) else None
-            episode = f"{first_ep}-{last_ep}" if last_ep and last_ep != first_ep else first_ep
+            first_ep = range_match.group(1)
+            last_ep = range_match.group(2) if range_match.group(2) else None
+            if last_ep and int(last_ep) < int(first_ep):
+                episode = None
+                episode_display = None
+            else:
+                # Internal IDs and grouping use canonical values, while the post
+                # retains exactly the digits/range the admin entered.
+                episode = f"{int(first_ep)}-{int(last_ep)}" if last_ep else str(int(first_ep))
         else:
             episode = None
+            episode_display = None
     title_key = _title_key(title)
     created_at = _now()
     logger.info(
@@ -768,6 +776,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
         "title_key": title_key,
         "season": season,
         "episode": episode,
+        "episode_display": episode_display,
         "quality": quality,
         "url": None,
         "access_token": None,
@@ -840,6 +849,7 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
                 "title_key": title_key,
                 "season": str(season),
                 "episode": str(episode),
+                "episode_display": episode_display or str(episode),
                 "created_at": created_at,
                 "published_targets": {},
             },
