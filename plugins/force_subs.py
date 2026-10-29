@@ -11,7 +11,7 @@ from helper.database import codeflixbots
 
 logger = logging.getLogger(__name__)
 _SETTINGS_ID = "global"
-_MAX_CHANNELS = 6
+_MAX_CHANNELS = 7
 
 
 def _default_channel(value: Any) -> dict[str, Any]:
