@@ -60,6 +60,9 @@ DEFAULT_ONGOING_TEMPLATE = (
     "‣ Quality : {qualities}╰━━━━━━━━━━━━━━━━━━━━━━\n"
     "✦ Powered By : @ANIFLIXANIMETAMIL"
 )
+DEFAULT_ANIME_BUTTONS_TEMPLATE = (
+    "#b 480P - {quality_480p} | #r 720P - {quality_720p} | #g 1080P - {quality_1080p}"
+)
 
 
 def _now():
@@ -171,6 +174,49 @@ def _buttons(files: dict[str, Any]) -> InlineKeyboardMarkup:
     ]])
 
 
+def _build_anime_button_rows(template: str, files: dict[str, Any], title: str = "") -> list[list[dict[str, str]]]:
+    """Render the editable Anime Post button template against verified File Store links.
+
+    Each non-empty line creates one row. Use `` | `` between button definitions to
+    keep multiple quality buttons on the same row. #b/#r/#g map to Bot API button styles.
+    """
+    style_map = {"b": "primary", "r": "danger", "g": "success"}
+    aliases = {
+        "{quality_480p}": "480p", "{link_480p}": "480p", "{480p}": "480p",
+        "{quality_720p}": "720p", "{link_720p}": "720p", "{720p}": "720p",
+        "{quality_1080p}": "1080p", "{link_1080p}": "1080p", "{1080p}": "1080p",
+    }
+    rows: list[list[dict[str, str]]] = []
+    found: list[str] = []
+    text = str(template or DEFAULT_ANIME_BUTTONS_TEMPLATE).strip()
+    for line_number, line in enumerate((line.strip() for line in text.splitlines() if line.strip()), start=1):
+        row: list[dict[str, str]] = []
+        for item in line.split(" | "):
+            match = re.match(r"^#([bgr])\s+(.+?)\s+-\s*(.*?)\s*$", item.strip(), re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Anime button line {line_number} is invalid. Use #b/#r/#g Button Name - {{quality_480p}}.")
+            color_code, label, raw_url = match.groups()
+            if not label.strip() or len(label.strip()) > 64:
+                raise ValueError(f"Anime button line {line_number}: names must be 1–64 characters.")
+            quality = aliases.get(raw_url.strip().casefold())
+            if not quality:
+                raise ValueError(f"Anime button line {line_number}: link must be {{quality_480p}}, {{quality_720p}}, or {{quality_1080p}}.")
+            if quality in found:
+                raise ValueError(f"Anime quality {quality} appears more than once in the button template.")
+            found.append(quality)
+            entry = files.get(_quality_field(quality)) or {}
+            url = str(entry.get("url") or "").strip()
+            if not (url.startswith("https://") or url.startswith("http://")):
+                raise ValueError(f"The stored {quality} File Store URL is missing; refusing to create a broken button.")
+            final_label = label.replace("{title}", title).replace("{anime}", title).strip()
+            row.append({"text": final_label, "url": url, "style": style_map[color_code.lower()]})
+        if row:
+            rows.append(row)
+    if set(found) != set(EXPECTED_QUALITIES) or len(found) != 3:
+        raise ValueError("Anime Buttons must contain exactly one button each for 480p, 720p, and 1080p.")
+    return rows
+
+
 def _render_post(route: dict, mode: str, title: str, season: str, episode: str,
                  files: dict[str, Any]) -> str:
     links = {q: files[_quality_field(q)]["url"] for q in EXPECTED_QUALITIES}
@@ -280,6 +326,22 @@ async def _send_target(client, route: dict, batch: dict, mode: str, target_overr
     else:
         route["ongoing_template"] = global_templates.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
     caption = _render_post(route, mode, title, season, episode, files)
+    if mode == "individual":
+        button_template = global_templates.get("anime_buttons_template") or DEFAULT_ANIME_BUTTONS_TEMPLATE
+        keyboard_rows = _build_anime_button_rows(button_template, files, title)
+        sent_id = await _send_ongoing_bot_api(client, int(chat.id), None, caption, keyboard_rows)
+        await codeflixbots.codeflixbots["episode_batches"].update_one(
+            {"_id": batch["_id"]},
+            {"$set": {
+                f"published_targets.{target_key}": {
+                    "chat_id": int(chat.id), "message_id": int(sent_id), "published_at": _now(),
+                },
+                "updated_at": _now(),
+            }},
+        )
+        logger.info("Published %s S%sE%s to Anime Post %s as message %s", title, season, episode, target, sent_id)
+        return True, "published"
+
     keyboard = _buttons(files)
     poster_file_id = None
     if mode == "ongoing":
