@@ -14,6 +14,7 @@ from config import Config
 from helper.auth import is_admin_user
 from helper.database import codeflixbots
 from helper.file_names import normalize_anime_title
+from plugins.channel_routing import resolve_ongoing_targets
 
 logger = logging.getLogger(__name__)
 DEFAULT_ONGOING_TEMPLATE = (
@@ -49,21 +50,6 @@ def _render_template(template: str, values: dict[str, Any], limit: int = 4096) -
         logger.exception("Invalid ongoing post template; falling back to default")
         text = DEFAULT_ONGOING_TEMPLATE.format_map(_SafeValues(values))
     return text[:limit]
-
-
-def _targets(route: dict) -> list[Any]:
-    values = route.get("ongoing_channels") or []
-    if not values and route.get("ongoing_channel"):
-        values = [route.get("ongoing_channel")]
-    result, seen = [], set()
-    for value in values:
-        if value is None or not str(value).strip():
-            continue
-        key = str(value).casefold()
-        if key not in seen:
-            seen.add(key)
-            result.append(value)
-    return result[:6]
 
 
 def _plain_label(value: str) -> str:
@@ -184,7 +170,12 @@ async def _send_bot_api(client: Client, chat_id: int, poster: str | None, captio
     raise RuntimeError("Telegram did not accept the ongoing post")
 
 
-async def post_ongoing_anime(client: Client, title: str) -> str:
+async def post_ongoing_anime(
+    client: Client,
+    title: str,
+    season: str | None = None,
+    episode_range: str | None = None,
+) -> str:
     """Publish the selected anime's ongoing post to its saved ongoing channel targets."""
     key = _title_key(title)
     if not key:
@@ -197,10 +188,14 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
     if not route:
         return f"❌ No saved channel/template settings were found for {title}. Add it in Admin Panel → Anime Channels."
 
-    invite_doc = await codeflixbots.codeflixbots["anime_invite_links"].find_one({"_id": route.get("title_key") or key})
+    invite_collection = codeflixbots.codeflixbots["anime_invite_links"]
+    route_key = str(route.get("title_key") or key).strip()
+    invite_doc = await invite_collection.find_one({"_id": key})
+    if not invite_doc and route_key != key:
+        invite_doc = await invite_collection.find_one({"_id": route_key})
+    if not invite_doc:
+        invite_doc = await invite_collection.find_one({"title_key": key})
     links = list((invite_doc or {}).get("links") or [])
-    if not links:
-        return f"❌ No invite links are saved for {route.get('title', title)}. Open Admin Panel → Anime Invite Links → Add Links first."
 
     post_settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
     button_template = post_settings.get("ongoing_buttons_template") or DEFAULT_ONGOING_BUTTONS_TEMPLATE
@@ -209,7 +204,7 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
     except ValueError as exc:
         return f"❌ Ongoing button template error: {exc}"
 
-    targets = _targets(route)
+    targets = await resolve_ongoing_targets(route, codeflixbots.codeflixbots)
     if not targets:
         return f"❌ No ongoing channel is assigned to {route.get('title', title)}. Configure it in Admin Panel → Anime Channels."
 
@@ -217,6 +212,8 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
     qualities = details.get("qualities") or "480p, 720p, 1080p"
     templates_collection = codeflixbots.codeflixbots["anime_templates"]
     saved_template = await templates_collection.find_one({"_id": key}) or {}
+    if not saved_template and route_key != key:
+        saved_template = await templates_collection.find_one({"_id": route_key}) or {}
     if not saved_template:
         saved_template = await templates_collection.find_one({"title_key": key}) or {}
     if not saved_template:
@@ -224,12 +221,14 @@ async def post_ongoing_anime(client: Client, title: str) -> str:
         escaped_title = re.escape(str(title or "").strip())
         if escaped_title:
             saved_template = await templates_collection.find_one({"title": {"$regex": f"^{escaped_title}$", "$options": "i"}}) or {}
+    season_value = str(season).strip() if season is not None and str(season).strip() else (details.get("season") or "—")
+    episode_value = str(episode_range).strip() if episode_range is not None and str(episode_range).strip() else (details.get("episode_range") or "—")
     values = {
         "anime": route.get("title") or title,
         "title": route.get("title") or title,
-        "season": details.get("season") or "—",
-        "episode_range": details.get("episode_range") or "—",
-        "episode": details.get("episode_range") or "—",
+        "season": season_value,
+        "episode_range": episode_value,
+        "episode": episode_value,
         "tag": details.get("tag") or "",
         "status": details.get("status") or "ONGOING",
         "qualities": qualities,

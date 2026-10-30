@@ -142,7 +142,9 @@ class RequestedUpdateTests(unittest.TestCase):
         file_rename = (ROOT / "plugins" / "file_rename.py").read_text(encoding="utf-8")
         panel = (ROOT / "plugins" / "admin_panel.py").read_text(encoding="utf-8")
         self.assertIn('if details.get("link_only"):', file_rename)
-        self.assertIn('_send_ongoing_bot_api(client, int(chat.id), None, caption, button_rows)', file_rename)
+        self.assertIn('await _send_ongoing_bot_api(client, api_target, None, caption, button_rows)', file_rename)
+        self.assertIn('await _post_ongoing_anime(', file_rename)
+        self.assertIn('individual_target.lstrip("-").isdigit()', file_rename)
         self.assertIn('batch1renamed_button_template', panel)
         self.assertIn('adm:batch1renamed_button_edit', panel)
 

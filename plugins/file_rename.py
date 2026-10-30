@@ -36,6 +36,7 @@ from plugins.episode_publisher import (
     DEFAULT_INDIVIDUAL_TEMPLATE, _send_ongoing_bot_api,
 )
 from plugins.channel_routing import resolve_ongoing_targets as _resolve_ongoing_targets_from_settings
+from plugins.ongoing_posts import post_ongoing_anime as _post_ongoing_anime
 
 async def _resolve_ongoing_targets(route: dict) -> list:
     """Resolve anime-specific ongoing targets with global-channel fallback."""
@@ -322,7 +323,7 @@ def _build_batch1renamed_button_rows(template: str, details: dict, stored_link: 
 
 
 async def _publish_batch1renamed_link(client, message, details: dict) -> None:
-    """Publish a supplied stored link without downloading or storing media again."""
+    """Publish a supplied stored link to Anime Post and Ongoing without media handling."""
     title = str(details.get("title") or "").strip()
     title_key = normalize_anime_title(title)
     link = str(details.get("stored_link") or "").strip()
@@ -330,47 +331,93 @@ async def _publish_batch1renamed_link(client, message, details: dict) -> None:
     route = await routes.find_one({"title_key": title_key}) if title_key else None
     if not route and title:
         route = await routes.find_one({"title": {"$regex": "^" + re.escape(title) + "$", "$options": "i"}})
-    if not route or not route.get("individual_channel"):
+    if not route:
         await message.reply_text(
-            f"❌ No Anime Post channel is saved for {title}. Add it in Admin Panel → Anime Channels first."
+            f"❌ No saved channel settings were found for {title}. Add it in Admin Panel → Anime Channels first."
         )
         return
 
+    episode = str(details.get("episode_range") or "").strip()
+    season = str(details.get("season") or "").strip()
+    anime_result = "❌ Anime Post was not published."
+
+    # Publish destinations independently. A missing/broken Anime Post target must
+    # never prevent the matching Ongoing post from being attempted.
     try:
+        individual_target = route.get("individual_channel")
+        if not individual_target:
+            raise RuntimeError("No Anime Post channel is assigned to this anime")
+
         settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
         template = settings.get("batch1renamed_button_template") or DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE
         button_rows = _build_batch1renamed_button_rows(template, details, link)
-        chat = await client.get_chat(route["individual_channel"])
         caption_template = settings.get("anime_post_template") or DEFAULT_INDIVIDUAL_TEMPLATE
-        episode = str(details.get("episode_range") or "").strip()
         caption_values = {
             "title": title, "anime": title,
-            "season": str(details.get("season") or ""),
+            "season": season,
             "episode": episode, "episode_range": episode,
             "qualities": "Stored link", "status": "ON", "audio": "Tamil Audio",
             "quality_480p": "", "quality_720p": "", "quality_1080p": "",
             "link_480p": "", "link_720p": "", "link_1080p": "",
         }
         caption = _safe_template(caption_template, caption_values)
-        sent_id = await _send_ongoing_bot_api(client, int(chat.id), None, caption, button_rows)
+
+        # Send directly through Bot API. Calling Pyrogram get_chat() with a private
+        # numeric channel ID may raise PEER_ID_INVALID after a Render restart.
+        api_target = (
+            int(individual_target)
+            if isinstance(individual_target, str) and individual_target.lstrip("-").isdigit()
+            else individual_target
+        )
+        sent_id = await _send_ongoing_bot_api(client, api_target, None, caption, button_rows)
+
+        # Resolve a public username only for a nicer history record; this lookup is
+        # deliberately non-fatal because the Bot API send has already succeeded.
+        chat = None
+        if not isinstance(api_target, int):
+            try:
+                chat = await client.get_chat(api_target)
+            except Exception:
+                logger.debug("Could not resolve Anime Post username after successful send: %s", api_target, exc_info=True)
+        recorded_chat_id = int(chat.id) if chat is not None else api_target
         try:
             await codeflixbots.codeflixbots["renamed_link_posts"].insert_one({
                 "user_id": int(message.from_user.id), "title": title, "title_key": title_key,
-                "season": str(details.get("season") or ""), "episode": episode,
-                "url": link, "channel_id": int(chat.id), "message_id": int(sent_id),
+                "season": season, "episode": episode,
+                "url": link, "channel_id": recorded_chat_id, "message_id": int(sent_id),
                 "created_at": datetime.utcnow(),
             })
         except Exception:
-            logger.exception("Post sent but link-only history could not be saved")
-        await message.reply_text(
-            f"✅ Link-only Anime Post published.\n🎬 {title} • Season {details.get('season')} • Episode {episode}\n"
-            f"📺 Channel: {getattr(chat, 'title', None) or route['individual_channel']}\n"
-            f"🔘 Button: {button_rows[0][0]['text']}\n"
-            "No media was downloaded or stored by this command."
+            logger.exception("Anime Post sent but link-only history could not be saved")
+
+        display_target = getattr(chat, "title", None) if chat is not None else str(individual_target)
+        anime_result = (
+            f"✅ Published to {display_target}\n"
+            f"🔘 Button: {button_rows[0][0]['text']}"
         )
     except Exception as exc:
-        logger.exception("Link-only /batch1renamed publishing failed")
-        await message.reply_text(f"❌ Could not publish the stored link: {type(exc).__name__}: {exc}")
+        logger.exception("Link-only /batch1renamed Anime Post failed")
+        anime_result = f"❌ Anime Post failed: {type(exc).__name__}: {exc}"
+
+    try:
+        ongoing_result = await _post_ongoing_anime(
+            client,
+            str(route.get("title") or title),
+            season=season,
+            episode_range=episode,
+        )
+    except Exception as exc:
+        logger.exception("Link-only /batch1renamed Ongoing publication failed")
+        ongoing_result = f"❌ Ongoing publication failed: {type(exc).__name__}: {exc}"
+
+    await message.reply_text(
+        f"🎬 {title} • Season {season} • Episode {episode}\n\n"
+        f"📺 Anime Post:\n{anime_result}\n\n"
+        f"📡 Ongoing:\n{ongoing_result}\n\n"
+        "No media was downloaded or stored by this command.",
+        disable_web_page_preview=True,
+        parse_mode=enums.ParseMode.DISABLED,
+    )
 
 
 async def _active_batch_task(user_id: int) -> dict | None:

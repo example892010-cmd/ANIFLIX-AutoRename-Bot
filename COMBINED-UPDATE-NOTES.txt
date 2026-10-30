@@ -13,3 +13,5 @@ Checks completed locally:
 
 Important verification limit:
 These checks are offline. The real Telegram workflow (bot admin permissions, MongoDB data, posting, button editing, and force-sub membership checks) still needs a live test after deployment. Clear All Links deletes saved access-link records and makes existing bot download links unusable; it does not delete media from the Telegram storage channel.
+
+7. `/batch1renamed` link-only publishing now attempts both Anime Post and Ongoing independently, using the current command season/episode, saved anime poster, shared Ongoing text, saved Ongoing Buttons, and the matching anime invite link. It skips all media download/rename/storage steps. Anime Post Bot API delivery now avoids private-channel peer-cache errors, and Ongoing channel resolution supports the active global-channel fallback.
